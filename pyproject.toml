@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "tg-channel-aggregator"
+version = "0.1.0"
+description = ""
+authors = ["Dmitriy Zharikhin <d.zharikhin@hh.ru>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+telethon = "^1.38.1"
+qrcode = "^8.0"
+pillow = "^11.1.0"
+eciespy = "^0.4.3"
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.10.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

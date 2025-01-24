@@ -76,25 +76,34 @@ class UserClientState:
         pass
 
     @classmethod
-    async def get_client(
+    async def get_or_create_client(
         cls,
         state_registry: dict[int, "UserClientState"],
         bot_client: TelegramClient,
-        event,
+        user_id: int,
+        event=None
     ) -> Optional[TelegramClient]:
-        current_state = state_registry.get(event.sender_id)
+        if event:
+            user_id = event.sender_id
+
+        if user_id != config.owner_user_id:
+            user = await bot_client.get_entity(user_id)
+            await bot_client.send_message(config.owner_user_id, f"User `{user_id}: {user.username}` tries to use bot")
+            return None
+
+        current_state = state_registry.get(user_id)
         if not current_state:
-            user_client = await init_user_client(event.sender_id)
-            state_registry[event.sender_id] = NotAuthorizedClient(
+            user_client = await init_user_client(user_id)
+            state_registry[user_id] = NotAuthorizedClient(
                 user_client=user_client, bot_client=bot_client
             )
         proceed_with_current_event = True
         while proceed_with_current_event:
-            current_state = state_registry[event.sender_id]
-            transition_status = await current_state.transition(event.sender_id, event)
-            state_registry[event.sender_id] = transition_status.new_state
+            current_state = state_registry[user_id]
+            transition_status = await current_state.transition(user_id, event)
+            state_registry[user_id] = transition_status.new_state
             proceed_with_current_event = transition_status.proceed_with_current_event
-        current_state = state_registry[event.sender_id]
+        current_state = state_registry[user_id]
         return (
             current_state._user_client
             if type(current_state) == AuthorizedClient
@@ -260,18 +269,27 @@ def get_user_config(user_id: str) -> dict[str, Any]:
     return {}
 
 
+async def check_clients_authorized(user_clients: dict[int, UserClientState], bot_client: TelegramClient):
+    while True:
+        for user_id, state in list(user_clients.items()):
+            if type(state) == AuthorizedClient:
+                await state.get_or_create_client(user_clients, bot_client, user_id)
+        await asyncio.sleep(config.user_client_check_period_seconds)
+
+
 async def main():
     bot_client = TelegramClient("bot", config.api_id, config.api_hash)
     bot_client = await bot_client.start(bot_token=config.bot_token)
+    tasks = []
     async with bot_client:
         logging.debug(f"Started bot {await bot_client.get_me()}")
-        user_clients = {}
+        user_client_registry = {}
 
         @bot_client.on(events.NewMessage(incoming=True, pattern="(?i)^/start"))
         async def list_channels_handler(event):
             if not (
-                user_client := await UserClientState.get_client(
-                    user_clients, bot_client, event
+                user_client := await UserClientState.get_or_create_client(
+                    user_client_registry, bot_client, event.sender_id, event
                 )
             ):
                 return
@@ -288,8 +306,8 @@ async def main():
         )
         async def subscribe_handler(event):
             if not (
-                user_client := await UserClientState.get_client(
-                    user_clients, bot_client, event
+                user_client := await UserClientState.get_or_create_client(
+                    user_client_registry, bot_client, event.sender_id, event
                 )
             ):
                 return
@@ -303,9 +321,13 @@ async def main():
 
         @bot_client.on(events.NewMessage(incoming=True, pattern="^[^/].+"))
         async def common_message_handler(event):
-            await UserClientState.get_client(user_clients, bot_client, event)
+            await UserClientState.get_or_create_client(user_client_registry, bot_client, event.sender_id, event)
+
+        tasks.append(asyncio.create_task(check_clients_authorized(user_client_registry, bot_client)))
 
         await bot_client.run_until_disconnected()
+        for task in tasks:
+            task.cancel("shutdown")
 
 
 # api_id = os.getenv("API_ID")
