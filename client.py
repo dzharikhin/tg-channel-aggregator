@@ -1,6 +1,6 @@
 import asyncio
 import dataclasses
-import itertools
+import datetime
 import json
 import logging
 import pathlib
@@ -14,6 +14,8 @@ from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError
 from telethon.events import CallbackQuery
 from telethon.tl.custom import QRLogin, Dialog
+from telethon.tl.types import DocumentAttributeFilename
+from typing_extensions import Literal
 
 import config
 
@@ -27,7 +29,7 @@ import config
 # sync - sync messages: mapping channel(may be "all") by date or by from_id
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.WARN,
     format="%(asctime)s.%(msecs)03d %(levelname)s %(funcName)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -286,37 +288,86 @@ async def check_clients_authorized(
 
 
 async def get_channels_page(
-    user_client: TelegramClient, page: int
-) -> tuple[list[Dialog], int | None, int | None]:
+    user_client: TelegramClient,
+    offset_stack: list[float],
+    action: Optional[tuple[float, Literal["backward", "forward"]]],
+) -> tuple[list[Dialog], list[float | None], Optional[float], Optional[float]]:
+    target_offset, action_type = action if action else (None, None)
     channels = []
-    async for dialog in user_client.iter_dialogs(archived=False, ignore_migrated=True):
+    async for dialog in user_client.iter_dialogs(
+        archived=False,
+        ignore_migrated=True,
+        **(
+            dict(offset_date=datetime.datetime.fromtimestamp(target_offset))
+            if target_offset and target_offset != -1
+            else {}
+        ),
+    ):
         if dialog.is_channel and not dialog.is_group and not dialog.is_user:
-            channels.append(dialog)
+            channels.append(
+                dialog
+            )  # dialog.entity.admin_rights.post_messages = True to get sinkable
+        if len(channels) >= config.dialog_list_page_size:
+            break
 
-    chunks = list(itertools.batched(channels, config.dialog_list_page_size))
-    return (
-        list(chunks[page]),
-        (page - 1 if page > 0 else None),
-        (page + 1 if page < (len(chunks) - 1) else None),
-    )
+    if not action_type:
+        previous_offset = None
+        offset_stack.append(-1)
+        next_offset = (
+            channels[-1].date.timestamp()
+            if len(channels) >= config.dialog_list_page_size
+            else None
+        )
+    elif "forward" == action_type:
+        previous_offset = offset_stack[-1] if offset_stack else None
+        offset_stack.append(target_offset)
+        next_offset = (
+            channels[-1].date.timestamp()
+            if len(channels) >= config.dialog_list_page_size
+            else None
+        )
+    elif "backward" == action_type:
+        offset_stack.pop()
+        next_offset = (
+            channels[-1].date.timestamp()
+            if len(channels) >= config.dialog_list_page_size
+            else None
+        )
+        previous_offset = offset_stack[-2] if len(offset_stack) >= 2 else None
+    else:
+        raise f"Unknown action type {action_type}"
+    print(f"returning for {action=}: {offset_stack=},{previous_offset=},{next_offset=}")
+    return channels, offset_stack, previous_offset, next_offset
 
 
 async def build_channel_response(
-    user_client: TelegramClient, page: int = 0
-) -> tuple[str, list[Button]]:
-    channels_page, previous_page, next_page = await get_channels_page(user_client, page)
+    user_client: TelegramClient,
+    offset_stack: list[float],
+    action: Optional[tuple[float, Literal["backward", "forward"]]] = None,
+) -> tuple[str, list[Button], tuple[bytes, list[DocumentAttributeFilename]]]:
+    channels_page, offset_stack, previous_offset, next_offset = await get_channels_page(
+        user_client, offset_stack, action
+    )
     previous_button = (
-        Button.inline("Previous", f"ch({previous_page})")
-        if previous_page is not None
+        Button.inline("<--", f"ch-list(backward:{previous_offset})")
+        if previous_offset is not None
         else None
     )
     next_button = (
-        Button.inline("Next", f"ch({next_page})") if next_page is not None else None
+        Button.inline("-->", f"ch-list(forward:{next_offset})")
+        if next_offset is not None
+        else None
     )
     channels_formatted = "\n".join(
         [f"- {channel.title}: `{channel.id}`" for channel in channels_page]
     )
-    return channels_formatted, [b for b in [previous_button, next_button] if b]
+    serialized_offset_stack = json.dumps(offset_stack).encode("utf-8")
+    file_name = [DocumentAttributeFilename("pagination-state.json")]
+    return (
+        channels_formatted,
+        [b for b in [previous_button, next_button] if b],
+        (serialized_offset_stack, file_name),
+    )
 
 
 async def main():
@@ -335,10 +386,20 @@ async def main():
                 )
             ):
                 return
-            message_text, buttons = await build_channel_response(user_client)
-            await event.respond(message_text, buttons=buttons)
 
-        @bot_client.on(events.CallbackQuery(data=re.compile("^ch\\((\\d+)\\)")))
+            message_text, buttons, (pagination_data, attributes) = (
+                await build_channel_response(user_client, [])
+            )
+            await event.respond(
+                message_text,
+                file=pagination_data,
+                attributes=attributes,
+                buttons=buttons,
+            )
+
+        @bot_client.on(
+            events.CallbackQuery(data=re.compile("^ch-list\\(([^:]+):([^:]+)\\)"))
+        )
         async def channels_pagination_handler(event: CallbackQuery.Event):
             if not (
                 user_client := await UserClientState.get_or_create_client(
@@ -346,9 +407,25 @@ async def main():
                 )
             ):
                 return
-            page = int(event.pattern_match.group(1).decode("utf-8"))
-            message_text, buttons = await build_channel_response(user_client, page)
-            await event.edit(message_text, buttons=buttons)
+
+            message = (
+                await bot_client.get_messages(event.chat_id, ids=[event.message_id])
+            )[0]
+            action_type = event.pattern_match.group(1).decode("utf-8").strip()
+            target_offset = float(event.pattern_match.group(2).decode("utf-8").strip())
+            value = (await message.download_media(file=bytes)).decode("utf-8")
+            offset_stack = json.loads(value)
+            message_text, buttons, (pagination_data, attributes) = (
+                await build_channel_response(
+                    user_client, offset_stack, (target_offset, action_type)
+                )
+            )
+            await event.edit(
+                message_text,
+                file=pagination_data,
+                attributes=attributes,
+                buttons=buttons,
+            )
 
         @bot_client.on(
             events.NewMessage(incoming=True, pattern="(?i)^/subscribe (-?\\d+)")
