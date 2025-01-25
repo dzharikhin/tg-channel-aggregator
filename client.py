@@ -371,7 +371,7 @@ async def build_channel_response(
 
 
 async def main():
-    bot_client = TelegramClient("bot", config.api_id, config.api_hash)
+    bot_client = TelegramClient(config.data_path.joinpath("bot"), config.api_id, config.api_hash)
     bot_client = await bot_client.start(bot_token=config.bot_token)
     tasks = []
     async with bot_client:
