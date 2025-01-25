@@ -1,16 +1,19 @@
 import asyncio
 import dataclasses
+import itertools
 import json
 import logging
 import pathlib
+import re
 from typing import Any, Optional
 
 import qrcode
 from ecies import decrypt, encrypt
 from ecies.utils import generate_eth_key
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.custom import QRLogin
+from telethon.events import CallbackQuery
+from telethon.tl.custom import QRLogin, Dialog
 
 import config
 
@@ -81,14 +84,17 @@ class UserClientState:
         state_registry: dict[int, "UserClientState"],
         bot_client: TelegramClient,
         user_id: int,
-        event=None
+        event=None,
     ) -> Optional[TelegramClient]:
         if event:
             user_id = event.sender_id
 
         if user_id != config.owner_user_id:
             user = await bot_client.get_entity(user_id)
-            await bot_client.send_message(config.owner_user_id, f"User `{user_id}: {user.username}` tries to use bot")
+            await bot_client.send_message(
+                config.owner_user_id,
+                f"User `{user_id}: {user.username}` tries to use bot",
+            )
             return None
 
         current_state = state_registry.get(user_id)
@@ -269,12 +275,48 @@ def get_user_config(user_id: str) -> dict[str, Any]:
     return {}
 
 
-async def check_clients_authorized(user_clients: dict[int, UserClientState], bot_client: TelegramClient):
+async def check_clients_authorized(
+    user_clients: dict[int, UserClientState], bot_client: TelegramClient
+):
     while True:
         for user_id, state in list(user_clients.items()):
             if type(state) == AuthorizedClient:
                 await state.get_or_create_client(user_clients, bot_client, user_id)
         await asyncio.sleep(config.user_client_check_period_seconds)
+
+
+async def get_channels_page(
+    user_client: TelegramClient, page: int
+) -> tuple[list[Dialog], int | None, int | None]:
+    channels = []
+    async for dialog in user_client.iter_dialogs(archived=False, ignore_migrated=True):
+        if dialog.is_channel and not dialog.is_group and not dialog.is_user:
+            channels.append(dialog)
+
+    chunks = list(itertools.batched(channels, config.dialog_list_page_size))
+    return (
+        list(chunks[page]),
+        (page - 1 if page > 0 else None),
+        (page + 1 if page < (len(chunks) - 1) else None),
+    )
+
+
+async def build_channel_response(
+    user_client: TelegramClient, page: int = 0
+) -> tuple[str, list[Button]]:
+    channels_page, previous_page, next_page = await get_channels_page(user_client, page)
+    previous_button = (
+        Button.inline("Previous", f"ch({previous_page})")
+        if previous_page is not None
+        else None
+    )
+    next_button = (
+        Button.inline("Next", f"ch({next_page})") if next_page is not None else None
+    )
+    channels_formatted = "\n".join(
+        [f"- {channel.title}: `{channel.id}`" for channel in channels_page]
+    )
+    return channels_formatted, [b for b in [previous_button, next_button] if b]
 
 
 async def main():
@@ -293,13 +335,20 @@ async def main():
                 )
             ):
                 return
-            channels = []
-            async for dialog in user_client.iter_dialogs(
-                archived=False, limit=config.dialog_list_limit
+            message_text, buttons = await build_channel_response(user_client)
+            await event.respond(message_text, buttons=buttons)
+
+        @bot_client.on(events.CallbackQuery(data=re.compile("^ch\\((\\d+)\\)")))
+        async def channels_pagination_handler(event: CallbackQuery.Event):
+            if not (
+                user_client := await UserClientState.get_or_create_client(
+                    user_client_registry, bot_client, event.sender_id, event
+                )
             ):
-                if dialog.is_channel:
-                    channels.append(f"- {dialog.title}: `{dialog.id}`")
-            await event.respond("\n".join(channels), parse_mode="md")
+                return
+            page = int(event.pattern_match.group(1).decode("utf-8"))
+            message_text, buttons = await build_channel_response(user_client, page)
+            await event.edit(message_text, buttons=buttons)
 
         @bot_client.on(
             events.NewMessage(incoming=True, pattern="(?i)^/subscribe (-?\\d+)")
@@ -321,9 +370,15 @@ async def main():
 
         @bot_client.on(events.NewMessage(incoming=True, pattern="^[^/].+"))
         async def common_message_handler(event):
-            await UserClientState.get_or_create_client(user_client_registry, bot_client, event.sender_id, event)
+            await UserClientState.get_or_create_client(
+                user_client_registry, bot_client, event.sender_id, event
+            )
 
-        tasks.append(asyncio.create_task(check_clients_authorized(user_client_registry, bot_client)))
+        tasks.append(
+            asyncio.create_task(
+                check_clients_authorized(user_client_registry, bot_client)
+            )
+        )
 
         await bot_client.run_until_disconnected()
         for task in tasks:
