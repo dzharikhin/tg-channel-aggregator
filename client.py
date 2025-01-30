@@ -1,35 +1,33 @@
 import asyncio
-import dataclasses
 import datetime
-import io
 import json
 import logging
-import os
-import pathlib
 import re
 from types import CoroutineType
-from typing import Any, Optional, cast
+from typing import Optional, cast
 
-import qrcode
-from ecies import decrypt, encrypt
-from ecies.utils import generate_eth_key
-from telethon import TelegramClient, events, Button
-from telethon.errors import SessionPasswordNeededError
-from telethon.events import CallbackQuery
-from telethon.tl.custom import QRLogin, Dialog, Message
-from telethon.tl.types import DocumentAttributeFilename
+from telethon import TelegramClient, events, Button, functions, utils
+from telethon.errors import RPCError
+from telethon.events import CallbackQuery, NewMessage
+from telethon.tl.custom import Dialog
+from telethon.tl.functions.channels import GetChannelsRequest
+from telethon.tl.types import DocumentAttributeFilename, Chat
+from telethon.tl.types.messages import Chats
 from typing_extensions import Literal
 
 import config
+from auth import UserClientState, NotAuthorizedClient, init_user_client
+from subscription import (
+    Sink,
+    subscribe_to_channel,
+    unsubscribe_from_channel,
+)
 
 # commands to implement:
-# - list-channels - shows user channels and ids
-# - sink - shows current sink channel
-# set-sink - sets sink channel
-# list-subscriptions - shows current subscriptions for aggregation
-# subscribe - add/update subscription
-# unsubscribe - remove subscription
-# sync - sync messages: mapping channel(may be "all") by date or by from_id
+# - list-channels [subs]- shows user channels and ids, subs - show only subscribed channels
+# subscribe {channel_id_from} {channel_id_to} {filter} - add/update subscription
+# unsubscribe - {channel_id_from} {channel_id_to}
+# sync - sync messages {cnannel_id/all}={full/msg_id/}[ {cnannel_id}={full/msg_id}...]: mapping channel(may be "all") to sink start offset(full means from first message)
 
 logging.basicConfig(
     level=logging.WARN,
@@ -40,307 +38,53 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.DEBUG)
 
 
-def is_debug():
-    return "true" == os.getenv("DEBUG", "False").lower()
-
-
-def _render_qr(data: str, user_id: int) -> bytes:
-    qr = qrcode.main.QRCode(
-        version=3,
-        box_size=20,
-        border=10,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    if is_debug():
-        img.save(config.data_path.joinpath(str(user_id)).joinpath("qr.png"))
-    buf = io.BytesIO()
-    img.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-
-@dataclasses.dataclass
-class Keys:
-    sk: str
-    pk: str
-
-
-def _generate_keys() -> Keys:
-    eth_k = generate_eth_key()
-    keys = Keys(eth_k.to_hex(), eth_k.public_key.to_hex())
-    return keys
-
-
-def _decode(encrypted_: str, sk: str):
-    return decrypt(sk, bytes.fromhex(encrypted_))
-
-
-@dataclasses.dataclass
-class TransitionStatus:
-    new_state: "UserClientState"
-    proceed_with_current_event: bool
-
-
-class UserClientState:
-    _bot_client: TelegramClient
-    _user_client: TelegramClient
-
-    async def transition(self, user_id: int, event) -> TransitionStatus:
-        pass
-
-    @classmethod
-    async def get_or_create_client(
-        cls,
-        state_registry: dict[int, "UserClientState"],
-        bot_client: TelegramClient,
-        user_id: int,
-        event=None,
-    ) -> Optional[TelegramClient]:
-        if event:
-            user_id = event.sender_id
-
-        if user_id != config.owner_user_id:
-            user = await bot_client.get_entity(user_id)
-            await bot_client.send_message(
-                config.owner_user_id,
-                f"User `{user_id}: {user.username}` tries to use bot",
-            )
-            return None
-
-        user_client = None
-        try:
-            current_state = state_registry.get(user_id)
-            if not current_state:
-                user_client = await init_user_client(user_id)
-                state_registry[user_id] = NotAuthorizedClient(
-                    user_client=user_client, bot_client=bot_client
-                )
-            proceed_with_current_event = True
-            while proceed_with_current_event:
-                current_state = state_registry[user_id]
-                transition_status = await current_state.transition(user_id, event)
-                state_registry[user_id] = transition_status.new_state
-                proceed_with_current_event = (
-                    transition_status.proceed_with_current_event
-                )
-            current_state = state_registry[user_id]
-            return (
-                current_state._user_client
-                if type(current_state) == AuthorizedClient
-                else None
-            )
-        except Exception as e:
-            logger.error(
-                f"Logging at auth user {user_id}, resetting to unauthorized", e
-            )
-            if not user_client:
-                user_client = await init_user_client(user_id)
-            state_registry[user_id] = NotAuthorizedClient(
-                user_client=user_client, bot_client=bot_client
-            )
-            await bot_client.send_message(
-                user_id,
-                "auth failed with unexpected exception. Please, wait and try again",
-            )
-            return None
-
-
-class NotAuthorizedClient(UserClientState):
-
-    def __init__(
-        self,
-        auth_message: Optional[Message] = None,
-        *,
-        from_state: Optional[UserClientState] = None,
-        user_client: Optional[TelegramClient] = None,
-        bot_client: Optional[TelegramClient] = None,
-    ):
-        self.auth_message = auth_message
-        if from_state:
-            self._bot_client = from_state._bot_client
-            self._user_client = from_state._user_client
-        else:
-            self._bot_client = bot_client
-            self._user_client = user_client
-
-    async def transition(self, user_id: int, event) -> TransitionStatus:
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(AuthorizedClient(self), True)
-        if not self._user_client.is_connected():
-            await self._user_client.connect()
-        qr_login = await self._user_client.qr_login()
-        img_bytes = _render_qr(qr_login.url, user_id)
-        if not self.auth_message:
-            self.auth_message = await self._bot_client.send_message(
-                user_id,
-                f"created at {datetime.datetime.now():%H-%M-%S}. Actual for {config.qr_login_wait_seconds} seconds. "
-                f"Open the image on a device that can be scanned with mobile Telegram scanner: Settings > Devices > Link Device",
-                file=img_bytes,
-                attributes=[DocumentAttributeFilename("login_qr.png")],
-            )
-        else:
-            await self._bot_client.edit_message(
-                user_id,
-                self.auth_message,
-                f"created at {datetime.datetime.now():%H-%M-%S}. Actual for {config.qr_login_wait_seconds} seconds. "
-                f"Open the image on a device that can be scanned with mobile Telegram scanner: Settings > Devices > Link Device",
-                file=img_bytes,
-                attributes=[DocumentAttributeFilename("login_qr.png")],
-            )
-        return TransitionStatus(
-            QrAuthorizationWaitingClient(qr_login, self.auth_message, self), True
-        )
-
-
-class AuthorizedClient(UserClientState):
-
-    def __init__(self, from_state: UserClientState):
-        self._user_client = from_state._user_client
-        self._bot_client = from_state._bot_client
-
-    async def transition(self, user_id: int, event=None) -> TransitionStatus:
-        if not self._user_client.is_connected():
-            await self._user_client.connect()
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(self, False)
-        return TransitionStatus(NotAuthorizedClient(from_state=self), True)
-
-
-class QrAuthorizationWaitingClient(UserClientState):
-
-    def __init__(
-        self, qr_login: QRLogin, auth_message: Message, from_state: UserClientState
-    ):
-        self._bot_client = from_state._bot_client
-        self._user_client = from_state._user_client
-        self._qr_login = qr_login
-        self._auth_message = auth_message
-
-    async def transition(self, user_id: int, event=None) -> TransitionStatus:
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(AuthorizedClient(self), True)
-        try:
-            await self._qr_login.wait(config.qr_login_wait_seconds)
-            await self._bot_client.delete_messages(
-                user_id, message_ids=[self._auth_message.id]
-            )
-            return TransitionStatus(AuthorizedClient(self), True)
-        except TimeoutError as e:
-            logger.info("Qr auth timeout exception, recreating qr", e)
-            return TransitionStatus(
-                NotAuthorizedClient(self._auth_message, from_state=self), True
-            )
-        except SessionPasswordNeededError as e:
-            logger.info("2FA password required", e)
-            await self._bot_client.delete_messages(
-                user_id, message_ids=[self._auth_message.id]
-            )
-            return TransitionStatus(
-                PasswordAuthorizationKeysPreparingClient(self), True
-            )
-
-
-class PasswordAuthorizationKeysPreparingClient(UserClientState):
-
-    def __init__(self, from_state: UserClientState):
-        self._user_client = from_state._user_client
-        self._bot_client = from_state._bot_client
-
-    async def transition(self, user_id: int, event=None) -> TransitionStatus:
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(AuthorizedClient(self), True)
-        keys = _generate_keys()
-        message = await self._bot_client.send_message(user_id, f"`{keys.pk}`")
-        if is_debug() and (path := pathlib.Path("pwd")).exists():
-            logger.error(
-                f"encrypted password: {encrypt(keys.pk, path.read_bytes()).hex()}"
-            )
-        return TransitionStatus(
-            PasswordAuthorizationWaitingClient(keys.sk, keys.pk, message.id, self),
-            False,
-        )
-
-
-class PasswordAuthorizationWaitingClient(UserClientState):
-
-    def __init__(
-        self,
-        secret_key: str,
-        public_key: str,
-        message_with_public_key_id: int,
-        from_state: UserClientState,
-    ):
-        self._user_client = from_state._user_client
-        self._bot_client = from_state._bot_client
-        self._secret_key = [secret_key]
-        self.public_key = public_key
-        self.public_key_msg_id = message_with_public_key_id
-
-    async def transition(self, user_id: int, event) -> TransitionStatus:
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(AuthorizedClient(self), True)
-        encrypted_ = event.message.message.strip()
-        await self._bot_client.delete_messages(
-            user_id, [self.public_key_msg_id, event.message.id]
-        )
-        try:
-            payload = _decode(encrypted_, self._secret_key.pop())
-        except ValueError as e:
-            logger.warning("Password input was not encrypted with current PK", e)
-            await self._bot_client.send_message(
-                user_id, "Password was not encrypted with public key. Lets try again"
-            )
-            return TransitionStatus(
-                PasswordAuthorizationKeysPreparingClient(self), True
-            )
-        logged_in_user = await self._user_client.sign_in(
-            password=payload.decode("utf-8")
-        )
-        logger.info(f"User {logged_in_user.id} logged in with password")
-        return TransitionStatus(AuthorizedClient(from_state=self), True)
-
-
-async def new_message_in_target_channel_handler(event):
-    # user_client.forward_messages(messages=[], )
-    logger.debug(event.stringify())
-
-
-async def init_user_client(user_id: int) -> TelegramClient:
-    config_folder = config.data_path.joinpath(str(user_id))
-    config_folder.mkdir(exist_ok=True)
-    user_client = TelegramClient(
-        config_folder.joinpath(config_folder.name), config.api_id, config.api_hash
-    )
-    user_config = get_user_config(config_folder.name)
-    for channel in user_config.get("channels", []):
-        user_client.add_event_handler(
-            new_message_in_target_channel_handler, events.NewMessage(chats=[channel])
-        )
-    await user_client.connect()
-    return user_client
-
-
-def get_user_config(user_id: str) -> dict[str, Any]:
-    config_path = config.data_path.joinpath(user_id).joinpath("config")
-    if config_path.exists():
-        return json.loads(config_path.read_text())
-    return {}
-
-
-async def check_clients_authorized(
+async def check_clients_consistency(
     user_clients: dict[int, UserClientState], bot_client: TelegramClient
 ):
     while True:
-        for user_id, state in list(user_clients.items()):
-            if type(state) == AuthorizedClient:
-                await state.get_or_create_client(user_clients, bot_client, user_id)
+        user_id = None
+        try:
+            await ensure_clients_consistency(user_clients, bot_client)
+        except RPCError as e:
+            logger.warning(f"Exception on consistency check for {user_id}, continue", e)
+            await bot_client.send_message(
+                config.owner_user_id, "exception on consistency check"
+            )
         await asyncio.sleep(config.user_client_check_period_seconds)
 
 
-async def get_channels_page(
+async def ensure_clients_consistency(
+    user_clients: dict[int, UserClientState],
+    bot_client: TelegramClient,
+    reinit_handlers: bool = False,
+):
+    for user_id, state in user_clients.items():
+        user_client = await state.get_or_create_client(
+            user_clients, bot_client, user_id
+        )
+        if not user_client:
+            continue
+
+        if reinit_handlers:
+            for handler, event in user_client.list_event_handlers():
+                user_client.remove_event_handler(handler, event)
+        subscriptions = config.get_all_user_subscriptions(user_id)
+        channels_to_listen = {ch for ch, _ in subscriptions}
+        current_handlers = user_client.list_event_handlers()
+        actual_subscribed_channels = {
+            list(e.chats)[0]
+            for _, e in current_handlers
+            if isinstance(e, events.NewMessage)
+        }
+        if len(actual_subscribed_channels) != len(current_handlers):
+            logger.warning(f"For user {user_id} there are duplicate handlers")
+        for to_add in channels_to_listen - actual_subscribed_channels:
+            subscribe_to_channel(user_id, user_client, to_add, bot_client)
+        for to_remove in actual_subscribed_channels - channels_to_listen:
+            unsubscribe_from_channel(user_client, to_remove, bot_client)
+
+
+async def get_all_channels_page(
     user_client: TelegramClient,
     offset_stack: list[float],
     action: Optional[tuple[float, Literal["backward", "forward"]]],
@@ -390,38 +134,155 @@ async def get_channels_page(
     else:
         raise f"Unknown action type {action_type}"
     logger.debug(
-        f"returning for {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
+        f"returning for all channels request {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
     )
     return channels, offset_stack, previous_offset, next_offset
 
 
-async def build_channel_response(
+async def build_all_channel_response(
+    user_id: int,
     user_client: TelegramClient,
     offset_stack: list[float],
     action: Optional[tuple[float, Literal["backward", "forward"]]] = None,
 ) -> tuple[str, list[Button], tuple[bytes, list[DocumentAttributeFilename]]]:
-    channels_page, offset_stack, previous_offset, next_offset = await get_channels_page(
-        user_client, offset_stack, action
+    channels_page, offset_stack, previous_offset, next_offset = (
+        await get_all_channels_page(user_client, offset_stack, action)
     )
+    return await format_channel_response(
+        "all",
+        channels_page,
+        offset_stack,
+        previous_offset,
+        next_offset,
+        dict(config.get_all_user_subscriptions(user_id)),
+    )
+
+
+async def build_subscribed_channel_response(
+    user_id: int,
+    user_client: TelegramClient,
+    offset_stack: list[int],
+    action: Optional[tuple[int, Literal["backward", "forward"]]] = None,
+) -> tuple[str, list[Button], tuple[bytes, list[DocumentAttributeFilename]]]:
+    target_offset, action_type = action if action else (0, None)
+    subscriptions = config.get_all_user_subscriptions(user_id)
+    subscription_slice = subscriptions[
+        target_offset : target_offset + config.dialog_list_page_size
+    ]
+    subscriptions_page = await user_client(
+        functions.channels.GetChannelsRequest(id=[s for s, _ in subscription_slice])
+    )
+
+    if not action_type:
+        previous_offset = None
+        offset_stack.append(0)
+        next_offset = (
+            subscription_slice[-1]
+            if len(subscription_slice) >= config.dialog_list_page_size
+            else None
+        )
+    elif "forward" == action_type:
+        previous_offset = offset_stack[-1] if offset_stack else None
+        offset_stack.append(target_offset)
+        next_offset = (
+            subscription_slice[-1]
+            if len(subscription_slice) >= config.dialog_list_page_size
+            else None
+        )
+    elif "backward" == action_type:
+        offset_stack.pop()
+        next_offset = (
+            subscription_slice[-1]
+            if len(subscription_slice) >= config.dialog_list_page_size
+            else None
+        )
+        previous_offset = offset_stack[-2] if len(offset_stack) >= 2 else None
+    else:
+        raise f"Unknown action type {action_type}"
+    logger.debug(
+        f"returning for subscribed channel request {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
+    )
+
+    return await format_channel_response(
+        "subs",
+        subscriptions_page.chats,
+        offset_stack,
+        previous_offset,
+        next_offset,
+        dict(subscriptions),
+    )
+
+
+async def format_channel_response(
+    request_type: str,
+    items: list[Dialog] | list[object],
+    offset_stack: list[float | None] | list[int],
+    previous_offset: Optional[float],
+    next_offset: Optional[float],
+    subscriptions: dict[int, list[Sink]],
+) -> tuple[str, list[Button], tuple[bytes, list[DocumentAttributeFilename]]]:
     previous_button = (
-        Button.inline("<--", f"ch-list(backward:{previous_offset})")
+        Button.inline("<--", f"ch-list-{request_type}(backward:{previous_offset})")
         if previous_offset is not None
         else None
     )
     next_button = (
-        Button.inline("-->", f"ch-list(forward:{next_offset})")
+        Button.inline("-->", f"ch-list-{request_type}(forward:{next_offset})")
         if next_offset is not None
         else None
     )
     channels_formatted = "\n".join(
-        [f"- {channel.title}: `{channel.id}`" for channel in channels_page]
+        [
+            f"- {channel.title}: `{channel.id}`"
+            f"{f" - subscribed to {", ".join((f"{sink.name}(`{sink.id}`)" for sink in subscriptions[utils.get_peer_id(channel)]))}" if utils.get_peer_id(channel) in subscriptions else ""}"
+            for channel in items
+        ]
     )
+    if not items:
+        channels_formatted = "No items to show"
     serialized_offset_stack = json.dumps(offset_stack).encode("utf-8")
     file_name = [DocumentAttributeFilename("pagination-state.json")]
     return (
         channels_formatted,
         [b for b in [previous_button, next_button] if b],
         (serialized_offset_stack, file_name),
+    )
+
+
+async def launch_current_users(
+    bot_client: TelegramClient,
+) -> dict[int, UserClientState]:
+    return {
+        user_id: NotAuthorizedClient(
+            user_client=await init_user_client(user_id),
+            bot_client=bot_client,
+        )
+        for user_id in config.get_existing_users()
+    }
+
+
+def has_send_message_permission(chat: Chat):
+    return chat.admin_rights.post_messages if chat else False
+
+
+def unwrap_single_chat(chat: Chats) -> Optional[Chat]:
+    if not chat or not chat.chats:
+        return None
+    return chat.chats[0]
+
+
+START_CMD = "(?i)^/start"
+LIST_CMD = "(?i)^/list"
+SUBSCRIBE_CMD = "(?i)^/subscribe (-?\\d+) (-?\\d+) ([\\S]+) ({.+})"
+UNSUBSCRIBE_CMD = "(?i)^/unsubscribe (-?\\d+) (-?\\d+)"
+
+
+def not_matched_command(txt: str) -> bool:
+    return not any(
+        (
+            re.match(pattern, txt)
+            for pattern in (START_CMD, LIST_CMD, SUBSCRIBE_CMD, UNSUBSCRIBE_CMD)
+        )
     )
 
 
@@ -435,10 +296,24 @@ async def main():
     tasks = []
     async with bot_client:
         logger.debug(f"Started bot {await bot_client.get_me()}")
-        user_client_registry = {}
+        user_client_registry = await launch_current_users(bot_client)
 
-        @bot_client.on(events.NewMessage(incoming=True, pattern="(?i)^/start"))
-        async def list_channels_handler(event):
+        @bot_client.on(events.NewMessage(incoming=True, pattern=not_matched_command))
+        @bot_client.on(events.NewMessage(incoming=True, pattern=START_CMD))
+        async def list_channels_handler(event: NewMessage.Event):
+            if not (
+                user_client := await UserClientState.get_or_create_client(
+                    user_client_registry, bot_client, event.sender_id, event
+                )
+            ):
+                return
+            logger.debug(f"Received unknown command: <{event.message.message}>")
+            await event.respond(
+                "/list - to list your channels\n/subscribe - to create/edit subscription\n/unsubscribe - to remove subscription\n/sync - to sync some channels historical data",
+            )
+
+        @bot_client.on(events.NewMessage(incoming=True, pattern=LIST_CMD))
+        async def list_channels_handler(event: NewMessage.Event):
             if not (
                 user_client := await UserClientState.get_or_create_client(
                     user_client_registry, bot_client, event.sender_id, event
@@ -446,18 +321,29 @@ async def main():
             ):
                 return
 
-            message_text, buttons, (pagination_data, attributes) = (
-                await build_channel_response(user_client, [])
+            if "subs" == event.text.removeprefix("/list").strip():
+                message_text, buttons, (pagination_data, attributes) = (
+                    await build_subscribed_channel_response(
+                        event.sender_id, user_client, []
+                    )
+                )
+            else:
+                message_text, buttons, (pagination_data, attributes) = (
+                    await build_all_channel_response(event.sender_id, user_client, [])
+                )
+            conditional_params = (
+                {"buttons": buttons, "file": pagination_data} if buttons else {}
             )
             await event.respond(
                 message_text,
-                file=pagination_data,
                 attributes=attributes,
-                buttons=buttons,
+                **conditional_params,
             )
 
         @bot_client.on(
-            events.CallbackQuery(data=re.compile("^ch-list\\(([^:]+):([^:]+)\\)"))
+            events.CallbackQuery(
+                data=re.compile("^ch-list-([^(]+)\\(([^:]+):([^:]+)\\)")
+            )
         )
         async def channels_pagination_handler(event: CallbackQuery.Event):
             if not (
@@ -470,15 +356,36 @@ async def main():
             message = (
                 await bot_client.get_messages(event.chat_id, ids=[event.message_id])
             )[0]
-            action_type = event.pattern_match.group(1).decode("utf-8").strip()
-            target_offset = float(event.pattern_match.group(2).decode("utf-8").strip())
+            request_type = event.pattern_match.group(1).decode("utf-8").strip()
+            action_type = event.pattern_match.group(2).decode("utf-8").strip()
             value = (await message.download_media(file=bytes)).decode("utf-8")
             offset_stack = json.loads(value)
-            message_text, buttons, (pagination_data, attributes) = (
-                await build_channel_response(
-                    user_client, offset_stack, (target_offset, action_type)
+            if "all" == request_type:
+                target_offset = float(
+                    event.pattern_match.group(3).decode("utf-8").strip()
                 )
-            )
+                message_text, buttons, (pagination_data, attributes) = (
+                    await build_all_channel_response(
+                        event.sender_id,
+                        user_client,
+                        offset_stack,
+                        (target_offset, action_type),
+                    )
+                )
+            elif "subs" == request_type:
+                target_offset = int(
+                    event.pattern_match.group(3).decode("utf-8").strip()
+                )
+                message_text, buttons, (pagination_data, attributes) = (
+                    await build_subscribed_channel_response(
+                        event.sender_id,
+                        user_client,
+                        offset_stack,
+                        (target_offset, action_type),
+                    )
+                )
+            else:
+                raise f"Unknown request type {request_type}"
             await event.edit(
                 message_text,
                 file=pagination_data,
@@ -486,33 +393,74 @@ async def main():
                 buttons=buttons,
             )
 
-        @bot_client.on(
-            events.NewMessage(incoming=True, pattern="(?i)^/subscribe (-?\\d+)")
-        )
-        async def subscribe_handler(event):
+        @bot_client.on(events.NewMessage(incoming=True, pattern=SUBSCRIBE_CMD))
+        async def subscribe_handler(event: NewMessage.Event):
             if not (
                 user_client := await UserClientState.get_or_create_client(
                     user_client_registry, bot_client, event.sender_id, event
                 )
             ):
                 return
-            channel_id = event.pattern_match.group(1).strip()
-            logger.debug(f"subscribing user {event.sender_id} to {channel_id=}")
-            user_client.add_event_handler(
-                new_message_in_target_channel_handler,
-                event=events.NewMessage(chats=[int(channel_id)]),
+            source_channel_id = event.pattern_match.group(1).strip()
+            sink_channel_id = event.pattern_match.group(2).strip()
+            filter_type = event.pattern_match.group(3).strip()
+            filter_params = event.pattern_match.group(4).strip()
+            logger.debug(
+                f"subscribing user {event.sender_id}: {source_channel_id=} -> {sink_channel_id} with filter {filter_type}({filter_params})"
             )
-            await event.respond(f"subscribed to channel {channel_id}")
+            channel = unwrap_single_chat(
+                await user_client(GetChannelsRequest(id=[int(sink_channel_id)]))
+            )
+            if not has_send_message_permission(channel):
+                await event.respond(
+                    f"You have no permission to send messages in {sink_channel_id}"
+                )
+                return
+
+            config.create_subscription(
+                event.sender_id,
+                source_channel_id,
+                (sink_channel_id, channel.title),
+                (filter_type, filter_params),
+            )
+            subscribe_to_channel(
+                event.sender_id, user_client, source_channel_id, bot_client
+            )
+            await event.respond(f"subscribed {source_channel_id} -> {sink_channel_id}")
+
+        @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD))
+        async def unsubscribe_handler(event: NewMessage.Event):
+            if not (
+                user_client := await UserClientState.get_or_create_client(
+                    user_client_registry, bot_client, event.sender_id, event
+                )
+            ):
+                return
+            source_channel_id = event.pattern_match.group(1).strip()
+            sink_channel_id = event.pattern_match.group(2).strip()
+            logger.debug(
+                f"unsubscribing user {event.sender_id}: {source_channel_id=} -> {sink_channel_id}"
+            )
+            if config.remove_subscription(
+                event.sender_id, source_channel_id, sink_channel_id
+            ):
+                unsubscribe_from_channel(user_client, source_channel_id, bot_client)
+            await event.respond(
+                f"unsubscribed {source_channel_id} -> {sink_channel_id}"
+            )
 
         @bot_client.on(events.NewMessage(incoming=True, pattern="^[^/].+"))
-        async def common_message_handler(event):
+        async def common_message_handler(event: NewMessage.Event):
             await UserClientState.get_or_create_client(
                 user_client_registry, bot_client, event.sender_id, event
             )
 
+        await ensure_clients_consistency(
+            user_client_registry, bot_client, reinit_handlers=True
+        )
         tasks.append(
             asyncio.create_task(
-                check_clients_authorized(user_client_registry, bot_client)
+                check_clients_consistency(user_client_registry, bot_client)
             )
         )
 
