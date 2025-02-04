@@ -1,33 +1,33 @@
 import asyncio
-import datetime
 import json
 import logging
 import re
+from asyncio import Future, Task
 from types import CoroutineType
 from typing import Optional, cast
 
-from telethon import TelegramClient, events, Button, functions, utils
-from telethon.errors import RPCError
+import persistqueue
+from telethon import TelegramClient, events
+from telethon.errors import RPCError, BadRequestError
 from telethon.events import CallbackQuery, NewMessage
-from telethon.tl.custom import Dialog
 from telethon.tl.functions.channels import GetChannelsRequest
-from telethon.tl.types import DocumentAttributeFilename, Chat
+from telethon.tl.types import Chat
 from telethon.tl.types.messages import Chats
-from typing_extensions import Literal
 
 import config
 from auth import UserClientState, NotAuthorizedClient, init_user_client
+from channels import build_all_channel_response, build_subscribed_channel_response
 from subscription import (
-    Sink,
     subscribe_to_channel,
     unsubscribe_from_channel,
+    forward_to_sinks,
 )
 
 # commands to implement:
-# - list-channels [subs]- shows user channels and ids, subs - show only subscribed channels
-# subscribe {channel_id_from} {channel_id_to} {filter} - add/update subscription
-# unsubscribe - {channel_id_from} {channel_id_to}
-# sync - sync messages {cnannel_id/all}={full/msg_id/}[ {cnannel_id}={full/msg_id}...]: mapping channel(may be "all") to sink start offset(full means from first message)
+# - list-channels [subs] - shows user channels and ids, subs - show only subscribed channels
+# - subscribe <channel_id_from> <channel_id_to> {<filter json>} - add/update subscription
+# - unsubscribe <channel_id_from> <channel_id_to>
+# - sync {"<channel_id>"/"all"="full"/<msg_id>[, "<channel_id>"="full"/<msg_id>]} - sync channels from offset
 
 logging.basicConfig(
     level=logging.WARN,
@@ -39,12 +39,14 @@ logger.setLevel(logging.DEBUG)
 
 
 async def check_clients_consistency(
-    user_clients: dict[int, UserClientState], bot_client: TelegramClient
+    user_clients: dict[int, UserClientState],
+    tasks: dict[str, Task],
+    bot_client: TelegramClient,
 ):
     while True:
         user_id = None
         try:
-            await ensure_clients_consistency(user_clients, bot_client)
+            await ensure_clients_consistency(user_clients, tasks, bot_client)
         except RPCError as e:
             logger.warning(f"Exception on consistency check for {user_id}, continue", e)
             await bot_client.send_message(
@@ -53,24 +55,70 @@ async def check_clients_consistency(
         await asyncio.sleep(config.user_client_check_period_seconds)
 
 
+async def handle_queue_tasks(
+    user_id: int,
+    queue: persistqueue.SQLiteAckQueue,
+    user_client: TelegramClient,
+    bot_client: TelegramClient,
+):
+    while True:
+        cmd = None
+        try:
+            cmd = await asyncio.to_thread(queue.get)
+            if "sync" == cmd["cmd"]:
+                channel_id = cmd["channel_id"]
+                channel = unwrap_single_chat(
+                    await user_client(GetChannelsRequest(id=[int(channel_id)]))
+                )
+                if not channel:
+                    raise ValueError(f"Channel {channel_id} is not available")
+                sinks = config.get_channel_subscriptions(user_id, channel_id)
+                if sinks:
+                    iter_params = {}
+                    from_offset = cmd["from"]
+                    if isinstance(from_offset, int):
+                        iter_params["min_id"] = from_offset - 1
+                    elif "full" == from_offset:
+                        pass
+                    else:
+                        raise ValueError(f"unknown <from> cmd: {cmd["from"]}")
+                    await user_client.end_takeout(False)
+                    async with user_client.takeout(channels=True) as takeout_client:
+                        async for message in takeout_client.iter_messages(
+                            channel, reverse=True, **iter_params
+                        ):
+                            await forward_to_sinks(
+                                user_id, user_client, message, sinks, bot_client
+                            )
+                queue.ack(cmd)
+            else:
+                raise ValueError(f"unknown cmd: {cmd}")
+        except (ValueError, BadRequestError) as e:
+            cmd_id = queue.ack_failed(cmd)
+            logger.warning(f"cannot handle {cmd_id}: {cmd} - marked as failed", e)
+            await bot_client.send_message(user_id, f"Failed to execute {cmd}: {e}")
+        except RPCError as e:
+            cmd_id = queue.nack(cmd)
+            logger.info(f"{cmd_id}: {cmd} - failed with {type(e)}, going to retry", e)
+
+
 async def ensure_clients_consistency(
     user_clients: dict[int, UserClientState],
+    tasks: dict[str, Future],
     bot_client: TelegramClient,
     reinit_handlers: bool = False,
 ):
     for user_id, state in user_clients.items():
-        user_client = await state.get_or_create_client(
-            user_clients, bot_client, user_id
-        )
-        if not user_client:
+        state = await state.get_or_create_client(user_clients, bot_client, user_id)
+        if not state:
             continue
 
         if reinit_handlers:
-            for handler, event in user_client.list_event_handlers():
-                user_client.remove_event_handler(handler, event)
+            for handler, event in state.user_client.list_event_handlers():
+                state.user_client.remove_event_handler(handler, event)
         subscriptions = config.get_all_user_subscriptions(user_id)
         channels_to_listen = {ch for ch, _ in subscriptions}
-        current_handlers = user_client.list_event_handlers()
+        current_handlers = state.user_client.list_event_handlers()
         actual_subscribed_channels = {
             list(e.chats)[0]
             for _, e in current_handlers
@@ -79,174 +127,19 @@ async def ensure_clients_consistency(
         if len(actual_subscribed_channels) != len(current_handlers):
             logger.warning(f"For user {user_id} there are duplicate handlers")
         for to_add in channels_to_listen - actual_subscribed_channels:
-            subscribe_to_channel(user_id, user_client, to_add, bot_client)
+            subscribe_to_channel(user_id, state.user_client, to_add, bot_client)
         for to_remove in actual_subscribed_channels - channels_to_listen:
-            unsubscribe_from_channel(user_client, to_remove, bot_client)
+            unsubscribe_from_channel(state.user_client, to_remove, bot_client)
 
-
-async def get_all_channels_page(
-    user_client: TelegramClient,
-    offset_stack: list[float],
-    action: Optional[tuple[float, Literal["backward", "forward"]]],
-) -> tuple[list[Dialog], list[float | None], Optional[float], Optional[float]]:
-    target_offset, action_type = action if action else (None, None)
-    channels = []
-    async for dialog in user_client.iter_dialogs(
-        archived=False,
-        ignore_migrated=True,
-        **(
-            dict(offset_date=datetime.datetime.fromtimestamp(target_offset))
-            if target_offset and target_offset != -1
-            else {}
-        ),
-    ):
-        if dialog.is_channel and not dialog.is_group and not dialog.is_user:
-            channels.append(
-                dialog
-            )  # dialog.entity.admin_rights.post_messages = True to get sinkable
-        if len(channels) >= config.dialog_list_page_size:
-            break
-
-    if not action_type:
-        previous_offset = None
-        offset_stack.append(-1)
-        next_offset = (
-            channels[-1].date.timestamp()
-            if len(channels) >= config.dialog_list_page_size
-            else None
-        )
-    elif "forward" == action_type:
-        previous_offset = offset_stack[-1] if offset_stack else None
-        offset_stack.append(target_offset)
-        next_offset = (
-            channels[-1].date.timestamp()
-            if len(channels) >= config.dialog_list_page_size
-            else None
-        )
-    elif "backward" == action_type:
-        offset_stack.pop()
-        next_offset = (
-            channels[-1].date.timestamp()
-            if len(channels) >= config.dialog_list_page_size
-            else None
-        )
-        previous_offset = offset_stack[-2] if len(offset_stack) >= 2 else None
-    else:
-        raise f"Unknown action type {action_type}"
-    logger.debug(
-        f"returning for all channels request {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
-    )
-    return channels, offset_stack, previous_offset, next_offset
-
-
-async def build_all_channel_response(
-    user_id: int,
-    user_client: TelegramClient,
-    offset_stack: list[float],
-    action: Optional[tuple[float, Literal["backward", "forward"]]] = None,
-) -> tuple[str, list[Button], tuple[bytes, list[DocumentAttributeFilename]]]:
-    channels_page, offset_stack, previous_offset, next_offset = (
-        await get_all_channels_page(user_client, offset_stack, action)
-    )
-    return await format_channel_response(
-        "all",
-        channels_page,
-        offset_stack,
-        previous_offset,
-        next_offset,
-        dict(config.get_all_user_subscriptions(user_id)),
-    )
-
-
-async def build_subscribed_channel_response(
-    user_id: int,
-    user_client: TelegramClient,
-    offset_stack: list[int],
-    action: Optional[tuple[int, Literal["backward", "forward"]]] = None,
-) -> tuple[str, list[Button], tuple[bytes, list[DocumentAttributeFilename]]]:
-    target_offset, action_type = action if action else (0, None)
-    subscriptions = config.get_all_user_subscriptions(user_id)
-    subscription_slice = subscriptions[
-        target_offset : target_offset + config.dialog_list_page_size
-    ]
-    subscriptions_page = await user_client(
-        functions.channels.GetChannelsRequest(id=[s for s, _ in subscription_slice])
-    )
-
-    if not action_type:
-        previous_offset = None
-        offset_stack.append(0)
-        next_offset = (
-            subscription_slice[-1]
-            if len(subscription_slice) >= config.dialog_list_page_size
-            else None
-        )
-    elif "forward" == action_type:
-        previous_offset = offset_stack[-1] if offset_stack else None
-        offset_stack.append(target_offset)
-        next_offset = (
-            subscription_slice[-1]
-            if len(subscription_slice) >= config.dialog_list_page_size
-            else None
-        )
-    elif "backward" == action_type:
-        offset_stack.pop()
-        next_offset = (
-            subscription_slice[-1]
-            if len(subscription_slice) >= config.dialog_list_page_size
-            else None
-        )
-        previous_offset = offset_stack[-2] if len(offset_stack) >= 2 else None
-    else:
-        raise f"Unknown action type {action_type}"
-    logger.debug(
-        f"returning for subscribed channel request {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
-    )
-
-    return await format_channel_response(
-        "subs",
-        subscriptions_page.chats,
-        offset_stack,
-        previous_offset,
-        next_offset,
-        dict(subscriptions),
-    )
-
-
-async def format_channel_response(
-    request_type: str,
-    items: list[Dialog] | list[object],
-    offset_stack: list[float | None] | list[int],
-    previous_offset: Optional[float],
-    next_offset: Optional[float],
-    subscriptions: dict[int, list[Sink]],
-) -> tuple[str, list[Button], tuple[bytes, list[DocumentAttributeFilename]]]:
-    previous_button = (
-        Button.inline("<--", f"ch-list-{request_type}(backward:{previous_offset})")
-        if previous_offset is not None
-        else None
-    )
-    next_button = (
-        Button.inline("-->", f"ch-list-{request_type}(forward:{next_offset})")
-        if next_offset is not None
-        else None
-    )
-    channels_formatted = "\n".join(
-        [
-            f"- {channel.title}: `{channel.id}`"
-            f"{f" - subscribed to {", ".join((f"{sink.name}(`{sink.id}`)" for sink in subscriptions[utils.get_peer_id(channel)]))}" if utils.get_peer_id(channel) in subscriptions else ""}"
-            for channel in items
-        ]
-    )
-    if not items:
-        channels_formatted = "No items to show"
-    serialized_offset_stack = json.dumps(offset_stack).encode("utf-8")
-    file_name = [DocumentAttributeFilename("pagination-state.json")]
-    return (
-        channels_formatted,
-        [b for b in [previous_button, next_button] if b],
-        (serialized_offset_stack, file_name),
-    )
+        if state.queue is not None:
+            handle_task_id = f"queue_handler-{user_id}"
+            current_task = tasks.get(handle_task_id)
+            if not current_task or current_task.done() or current_task.cancelled():
+                tasks[handle_task_id] = asyncio.create_task(
+                    handle_queue_tasks(
+                        user_id, state.queue, state.user_client, bot_client
+                    ),
+                )
 
 
 async def launch_current_users(
@@ -275,13 +168,20 @@ START_CMD = "(?i)^/start"
 LIST_CMD = "(?i)^/list"
 SUBSCRIBE_CMD = "(?i)^/subscribe (-?\\d+) (-?\\d+) ([\\S]+) ({.+})"
 UNSUBSCRIBE_CMD = "(?i)^/unsubscribe (-?\\d+) (-?\\d+)"
+SYNC_CMD = "(?i)^/sync ({.+})"
 
 
 def not_matched_command(txt: str) -> bool:
     return not any(
         (
             re.match(pattern, txt)
-            for pattern in (START_CMD, LIST_CMD, SUBSCRIBE_CMD, UNSUBSCRIBE_CMD)
+            for pattern in (
+                START_CMD,
+                LIST_CMD,
+                SUBSCRIBE_CMD,
+                UNSUBSCRIBE_CMD,
+                SYNC_CMD,
+            )
         )
     )
 
@@ -293,7 +193,7 @@ async def main():
             config.data_path.joinpath("bot"), config.api_id, config.api_hash
         ).start(bot_token=config.bot_token),
     )
-    tasks = []
+    tasks = {}
     async with bot_client:
         logger.debug(f"Started bot {await bot_client.get_me()}")
         user_client_registry = await launch_current_users(bot_client)
@@ -302,7 +202,7 @@ async def main():
         @bot_client.on(events.NewMessage(incoming=True, pattern=START_CMD))
         async def list_channels_handler(event: NewMessage.Event):
             if not (
-                user_client := await UserClientState.get_or_create_client(
+                await UserClientState.get_or_create_client(
                     user_client_registry, bot_client, event.sender_id, event
                 )
             ):
@@ -315,7 +215,7 @@ async def main():
         @bot_client.on(events.NewMessage(incoming=True, pattern=LIST_CMD))
         async def list_channels_handler(event: NewMessage.Event):
             if not (
-                user_client := await UserClientState.get_or_create_client(
+                state := await UserClientState.get_or_create_client(
                     user_client_registry, bot_client, event.sender_id, event
                 )
             ):
@@ -324,12 +224,14 @@ async def main():
             if "subs" == event.text.removeprefix("/list").strip():
                 message_text, buttons, (pagination_data, attributes) = (
                     await build_subscribed_channel_response(
-                        event.sender_id, user_client, []
+                        event.sender_id, state.user_client, []
                     )
                 )
             else:
                 message_text, buttons, (pagination_data, attributes) = (
-                    await build_all_channel_response(event.sender_id, user_client, [])
+                    await build_all_channel_response(
+                        event.sender_id, state.user_client, []
+                    )
                 )
             conditional_params = (
                 {"buttons": buttons, "file": pagination_data} if buttons else {}
@@ -347,7 +249,7 @@ async def main():
         )
         async def channels_pagination_handler(event: CallbackQuery.Event):
             if not (
-                user_client := await UserClientState.get_or_create_client(
+                state := await UserClientState.get_or_create_client(
                     user_client_registry, bot_client, event.sender_id, event
                 )
             ):
@@ -367,7 +269,7 @@ async def main():
                 message_text, buttons, (pagination_data, attributes) = (
                     await build_all_channel_response(
                         event.sender_id,
-                        user_client,
+                        state.user_client,
                         offset_stack,
                         (target_offset, action_type),
                     )
@@ -379,7 +281,7 @@ async def main():
                 message_text, buttons, (pagination_data, attributes) = (
                     await build_subscribed_channel_response(
                         event.sender_id,
-                        user_client,
+                        state.user_client,
                         offset_stack,
                         (target_offset, action_type),
                     )
@@ -396,7 +298,7 @@ async def main():
         @bot_client.on(events.NewMessage(incoming=True, pattern=SUBSCRIBE_CMD))
         async def subscribe_handler(event: NewMessage.Event):
             if not (
-                user_client := await UserClientState.get_or_create_client(
+                state := await UserClientState.get_or_create_client(
                     user_client_registry, bot_client, event.sender_id, event
                 )
             ):
@@ -409,7 +311,7 @@ async def main():
                 f"subscribing user {event.sender_id}: {source_channel_id=} -> {sink_channel_id} with filter {filter_type}({filter_params})"
             )
             channel = unwrap_single_chat(
-                await user_client(GetChannelsRequest(id=[int(sink_channel_id)]))
+                await state.user_client(GetChannelsRequest(id=[int(sink_channel_id)]))
             )
             if not has_send_message_permission(channel):
                 await event.respond(
@@ -424,14 +326,14 @@ async def main():
                 (filter_type, filter_params),
             )
             subscribe_to_channel(
-                event.sender_id, user_client, source_channel_id, bot_client
+                event.sender_id, state.user_client, source_channel_id, bot_client
             )
             await event.respond(f"subscribed {source_channel_id} -> {sink_channel_id}")
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD))
         async def unsubscribe_handler(event: NewMessage.Event):
             if not (
-                user_client := await UserClientState.get_or_create_client(
+                state := await UserClientState.get_or_create_client(
                     user_client_registry, bot_client, event.sender_id, event
                 )
             ):
@@ -444,10 +346,55 @@ async def main():
             if config.remove_subscription(
                 event.sender_id, source_channel_id, sink_channel_id
             ):
-                unsubscribe_from_channel(user_client, source_channel_id, bot_client)
+                unsubscribe_from_channel(
+                    state.user_client, source_channel_id, bot_client
+                )
             await event.respond(
                 f"unsubscribed {source_channel_id} -> {sink_channel_id}"
             )
+
+        @bot_client.on(events.NewMessage(incoming=True, pattern=SYNC_CMD))
+        async def sync_handler(event: NewMessage.Event):
+            if not (
+                state := await UserClientState.get_or_create_client(
+                    user_client_registry, bot_client, event.sender_id, event
+                )
+            ):
+                return
+
+            mapping = event.pattern_match.group(1).strip()
+            try:
+                mapping = json.loads(mapping)
+                invalid_channels = [
+                    k for k in mapping.keys() if (not isinstance(k, int) and k != "all")
+                ]
+                invalid_offsets = [
+                    v
+                    for v in mapping.values()
+                    if (not isinstance(v, int) and v != "full")
+                ]
+                if invalid_channels or invalid_offsets:
+                    raise ValueError(
+                        f"Invalid channels: {invalid_channels}, invalid offsets: {invalid_offsets}"
+                    )
+            except ValueError as e:
+                logger.info(f"Error on parsing {mapping}", e)
+                event.reply(
+                    'Argument must be valid json: {"channel_key": [msg_id]/"full"}'
+                )
+                return
+
+            default_offset = mapping.pop("all", None)
+            task_dict = {int(k): v for k, v in mapping}
+            if default_offset:
+                for channel_id, _ in config.get_all_user_subscriptions(event.sender_id):
+                    if channel_id not in task_dict:
+                        task_dict[channel_id] = default_offset
+
+            for channel_id, offset in task_dict.items():
+                state.queue.put(
+                    {"cmd": "sync", "channel_id": channel_id, "from": offset}
+                )
 
         @bot_client.on(events.NewMessage(incoming=True, pattern="^[^/].+"))
         async def common_message_handler(event: NewMessage.Event):
@@ -456,17 +403,14 @@ async def main():
             )
 
         await ensure_clients_consistency(
-            user_client_registry, bot_client, reinit_handlers=True
+            user_client_registry, tasks, bot_client, reinit_handlers=True
         )
-        tasks.append(
-            asyncio.create_task(
-                check_clients_consistency(user_client_registry, bot_client)
-            )
+        tasks["check_clients_consistency"] = asyncio.create_task(
+            check_clients_consistency(user_client_registry, tasks, bot_client)
         )
-
         await bot_client.run_until_disconnected()
-        for task in tasks:
-            task.cancel("shutdown")
+    for task in tasks.values():
+        task.cancel("shutdown")
 
 
 # api_id = os.getenv("API_ID")

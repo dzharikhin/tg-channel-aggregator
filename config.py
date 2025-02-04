@@ -11,6 +11,7 @@ data_path = pathlib.Path("data")
 qr_login_wait_seconds = 60
 user_client_check_period_seconds = 10
 dialog_list_page_size = 10
+max_queue_workers = 3
 
 owner_user_id = int(os.getenv("OWNER_USER_ID", "0"))
 

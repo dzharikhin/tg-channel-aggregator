@@ -3,7 +3,8 @@ import logging
 from functools import partial
 from typing import cast, Any
 
-from telethon import events, TelegramClient
+import telethon
+from telethon import events, TelegramClient, custom
 from telethon.errors import RPCError
 from telethon.events import NewMessage
 from telethon.tl.types import DocumentAttributeAudio
@@ -15,7 +16,7 @@ logger.setLevel(logging.DEBUG)
 
 
 class Filter:
-    def filter_update_event(self, event: events.NewMessage.Event) -> bool:
+    def filter_message(self, message) -> bool:
         pass
 
     @staticmethod
@@ -32,14 +33,16 @@ class Mp3Filter(Filter):
         self.min_length_seconds = params["min_seconds"]
         self.max_length_seconds = params["max_seconds"]
 
-    def filter_update_event(self, event: events.NewMessage.Event) -> bool:
-        if not event.message.media or not event.message.media.document:
+    def filter_message(self, message) -> bool:
+        if not isinstance(message, (telethon.tl.types.Message, custom.Message)):
             return False
-        if event.message.media.document.mime_type != "audio/mpeg":
+        if not message.media or not message.media.document:
             return False
-        if not event.message.media.document.attributes or not [
+        if message.media.document.mime_type not in {"audio/mpeg", "audio/mp3"}:
+            return False
+        if not message.media.document.attributes or not [
             audio_attr := cast(DocumentAttributeAudio, attr)
-            for attr in event.message.media.document.attributes
+            for attr in message.media.document.attributes
             if isinstance(attr, DocumentAttributeAudio)
         ]:
             return False
@@ -60,28 +63,36 @@ class Sink(Filter):
         self.id = int(sink_id)
         sink_cfg = json.loads(sink_config)
         self.name = sink_cfg["sink_name"]
-        self._filter = Filter.get_filter(**sink_cfg["filter"])
+        self.filter = Filter.get_filter(**sink_cfg["filter"])
 
-    def filter_update_event(self, event: events.NewMessage.Event) -> bool:
-        return self._filter.filter_update_event(event)
+    def filter_message(self, message) -> bool:
+        return self.filter.filter_message(message)
 
     def __repr__(self):
-        return f"Sink[id={self.id}, name={self.name}, filter={self._filter}]"
+        return f"Sink[id={self.id}, name={self.name}, filter={self.filter}]"
 
 
 async def new_message_in_target_channel_handler(
     user_id: int, bot_client: TelegramClient, event: NewMessage.Event
 ):
     sinks_for_channel = config.get_channel_subscriptions(user_id, event.sender_id)
+    await forward_to_sinks(
+        user_id, event.client, event.message, sinks_for_channel, bot_client
+    )
+
+
+async def forward_to_sinks(
+    user_id, user_client, message, sinks_for_channel, bot_client
+):
     for sink in sinks_for_channel:
-        if not sink.filter_update_event(event):
+        if not sink.filter_message(message):
             logger.debug(
-                f"For user {user_id} got event {event.stringify()}, did not match for sink {sink}, skipping"
+                f"For user {user_id} got message {message.stringify()}, did not match for sink {sink}, skipping"
             )
             continue
         try:
-            result = await event.client.forward_messages(sink.id, event.message)
-            logging.debug(f"Forwarded {event} to {sink} with result {result}")
+            result = await user_client.forward_messages(sink.id, message)
+            logging.debug(f"Forwarded {message} to {sink} with result {result}")
         except RPCError as e:
             logger.warning(
                 f"User {user_id} has no permission to send messages in {sink.name}({sink.id})",

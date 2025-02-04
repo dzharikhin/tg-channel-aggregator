@@ -5,9 +5,11 @@ import logging
 import pathlib
 from typing import Optional
 
+import persistqueue.serializers.json
 import qrcode
 from ecies import decrypt, encrypt
 from ecies.utils import generate_eth_key
+from persistqueue import SQLiteAckQueue
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.custom import QRLogin
@@ -67,7 +69,8 @@ class TransitionStatus:
 
 class UserClientState:
     _bot_client: TelegramClient
-    _user_client: TelegramClient
+    user_client: TelegramClient
+    queue: SQLiteAckQueue | None
 
     async def transition(self, user_id: int, event) -> TransitionStatus:
         pass
@@ -79,7 +82,7 @@ class UserClientState:
         bot_client: TelegramClient,
         user_id: int,
         event=None,
-    ) -> Optional[TelegramClient]:
+    ) -> Optional["UserClientState"]:
         if event:
             user_id = event.sender_id
 
@@ -109,9 +112,7 @@ class UserClientState:
                 )
             current_state = state_registry[user_id]
             return (
-                current_state._user_client
-                if isinstance(current_state, AuthorizedClient)
-                else None
+                current_state if isinstance(current_state, AuthorizedClient) else None
             )
         except Exception as e:
             logger.error(
@@ -142,17 +143,17 @@ class NotAuthorizedClient(UserClientState):
         self.auth_message = auth_message
         if from_state:
             self._bot_client = from_state._bot_client
-            self._user_client = from_state._user_client
+            self.user_client = from_state.user_client
         else:
             self._bot_client = bot_client
-            self._user_client = user_client
+            self.user_client = user_client
 
     async def transition(self, user_id: int, event) -> TransitionStatus:
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(AuthorizedClient(self), True)
-        if not self._user_client.is_connected():
-            await self._user_client.connect()
-        qr_login = await self._user_client.qr_login()
+        if await self.user_client.is_user_authorized():
+            return TransitionStatus(AuthorizedClient(user_id, self), True)
+        if not self.user_client.is_connected():
+            await self.user_client.connect()
+        qr_login = await self.user_client.qr_login()
         img_bytes = _render_qr(qr_login.url, user_id)
         if not self.auth_message:
             self.auth_message = await self._bot_client.send_message(
@@ -178,14 +179,21 @@ class NotAuthorizedClient(UserClientState):
 
 class AuthorizedClient(UserClientState):
 
-    def __init__(self, from_state: UserClientState):
-        self._user_client = from_state._user_client
+    def __init__(self, user_id: int, from_state: UserClientState):
+        self.user_client = from_state.user_client
         self._bot_client = from_state._bot_client
+        self.queue = SQLiteAckQueue(
+            config.data_path.joinpath(str(user_id)),
+            serializer=persistqueue.serializers.json,
+            multithreading=True,
+            auto_commit=True,
+            db_file_name="queue.db",
+        )
 
     async def transition(self, user_id: int, event=None) -> TransitionStatus:
-        if not self._user_client.is_connected():
-            await self._user_client.connect()
-        if await self._user_client.is_user_authorized():
+        if not self.user_client.is_connected():
+            await self.user_client.connect()
+        if await self.user_client.is_user_authorized():
             return TransitionStatus(self, False)
         return TransitionStatus(NotAuthorizedClient(from_state=self), True)
 
@@ -196,19 +204,19 @@ class QrAuthorizationWaitingClient(UserClientState):
         self, qr_login: QRLogin, auth_message: Message, from_state: UserClientState
     ):
         self._bot_client = from_state._bot_client
-        self._user_client = from_state._user_client
+        self.user_client = from_state.user_client
         self._qr_login = qr_login
         self._auth_message = auth_message
 
     async def transition(self, user_id: int, event=None) -> TransitionStatus:
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(AuthorizedClient(self), True)
+        if await self.user_client.is_user_authorized():
+            return TransitionStatus(AuthorizedClient(user_id, self), True)
         try:
             await self._qr_login.wait(config.qr_login_wait_seconds)
             await self._bot_client.delete_messages(
                 user_id, message_ids=[self._auth_message.id]
             )
-            return TransitionStatus(AuthorizedClient(self), True)
+            return TransitionStatus(AuthorizedClient(user_id, self), True)
         except TimeoutError as e:
             logger.info("Qr auth timeout exception, recreating qr", e)
             return TransitionStatus(
@@ -227,14 +235,17 @@ class QrAuthorizationWaitingClient(UserClientState):
 class PasswordAuthorizationKeysPreparingClient(UserClientState):
 
     def __init__(self, from_state: UserClientState):
-        self._user_client = from_state._user_client
+        self.user_client = from_state.user_client
         self._bot_client = from_state._bot_client
 
     async def transition(self, user_id: int, event=None) -> TransitionStatus:
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(AuthorizedClient(self), True)
+        if await self.user_client.is_user_authorized():
+            return TransitionStatus(AuthorizedClient(user_id, self), True)
         keys = _generate_keys()
-        message = await self._bot_client.send_message(user_id, f"`{keys.pk}`")
+        message = await self._bot_client.send_message(
+            user_id,
+            f"Password is required. DO NOT ENTER IN PLAIN TEXT. Encrypt via https://dzharikhin.github.io/ecies/index.html with public key `{keys.pk}` and send crypto message here",
+        )
         if is_debug() and (path := pathlib.Path("pwd")).exists():
             logger.error(
                 f"encrypted password: {encrypt(keys.pk, path.read_bytes()).hex()}"
@@ -254,15 +265,15 @@ class PasswordAuthorizationWaitingClient(UserClientState):
         message_with_public_key_id: int,
         from_state: UserClientState,
     ):
-        self._user_client = from_state._user_client
+        self.user_client = from_state.user_client
         self._bot_client = from_state._bot_client
         self._secret_key = [secret_key]
         self.public_key = public_key
         self.public_key_msg_id = message_with_public_key_id
 
     async def transition(self, user_id: int, event) -> TransitionStatus:
-        if await self._user_client.is_user_authorized():
-            return TransitionStatus(AuthorizedClient(self), True)
+        if await self.user_client.is_user_authorized():
+            return TransitionStatus(AuthorizedClient(user_id, self), True)
         encrypted_ = event.message.message.strip()
         await self._bot_client.delete_messages(
             user_id, [self.public_key_msg_id, event.message.id]
@@ -277,11 +288,11 @@ class PasswordAuthorizationWaitingClient(UserClientState):
             return TransitionStatus(
                 PasswordAuthorizationKeysPreparingClient(self), True
             )
-        logged_in_user = await self._user_client.sign_in(
+        logged_in_user = await self.user_client.sign_in(
             password=payload.decode("utf-8")
         )
         logger.info(f"User {logged_in_user.id} logged in with password")
-        return TransitionStatus(AuthorizedClient(from_state=self), True)
+        return TransitionStatus(AuthorizedClient(user_id, self), True)
 
 
 async def init_user_client(user_id: int) -> TelegramClient:

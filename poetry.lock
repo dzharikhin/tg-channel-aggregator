@@ -470,6 +470,20 @@ files = [
 ]
 
 [[package]]
+name = "persist-queue"
+version = "1.0.0"
+description = "A thread-safe disk based persistent queue in Python."
+optional = false
+python-versions = "*"
+files = [
+    {file = "persist-queue-1.0.0.tar.gz", hash = "sha256:3ffb746902d3023fd09eb46897609fdee6c77b1641f19e2fc8d98d744bdfc845"},
+    {file = "persist_queue-1.0.0-py3-none-any.whl", hash = "sha256:81bb20030b480fcacecc3abe6261480c818246f4d838fdf0217e36c2552a5f3a"},
+]
+
+[package.extras]
+extra = ["DBUtils (<3.0.0)", "PyMySQL", "cbor2 (>=5.2.0)", "msgpack (>=0.5.6)"]
+
+[[package]]
 name = "pillow"
 version = "11.1.0"
 description = "Python Imaging Library (Fork)"
@@ -722,4 +736,4 @@ files = [
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "4814e3f92ca7aa02759e2edfe366d8f570d69b5b4842d4965a906718b3c48db7"
+content-hash = "911e08b96ab5095da9ef1f3464d4e63a72cc00699c70ea2dae9030026f7fe30d"

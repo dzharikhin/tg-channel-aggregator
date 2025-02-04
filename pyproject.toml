@@ -11,6 +11,7 @@ telethon = "^1.38.1"
 qrcode = "^8.0"
 pillow = "^11.1.0"
 eciespy = "^0.4.3"
+persist-queue = "^1.0.0"
 
 
 [tool.poetry.group.dev.dependencies]
