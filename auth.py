@@ -90,7 +90,7 @@ class UserClientState:
             user = await bot_client.get_entity(user_id)
             await bot_client.send_message(
                 config.owner_user_id,
-                f"User `{user_id}: {user.username}` tries to use bot",
+                f"User `{user_id}`: {user.username} tries to use bot",
             )
             return None
 

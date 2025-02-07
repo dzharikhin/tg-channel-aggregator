@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import re
 
 from subscription import Sink
 
@@ -52,7 +53,7 @@ def get_existing_users() -> list[int]:
     return [
         int(user_data.name)
         for user_data in data_path.iterdir()
-        if not user_data.name.startswith("bot")
+        if re.match("\\d+", user_data.name)
     ]
 
 
