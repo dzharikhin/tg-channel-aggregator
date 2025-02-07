@@ -102,3 +102,10 @@ def remove_subscription(user_id: int, source_channel_id, sink_channel_id) -> boo
     if is_empty:
         source_config_path.rmdir()
     return is_empty
+
+
+def get_allowed_to_use_user_ids() -> list[int]:
+    whitelist_path = data_path.joinpath("user_whitelist")
+    if not whitelist_path.exists():
+        return []
+    return [int(user.name) for user in whitelist_path.iterdir()]

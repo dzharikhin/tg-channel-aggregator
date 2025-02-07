@@ -86,7 +86,10 @@ class UserClientState:
         if event:
             user_id = event.sender_id
 
-        if user_id != config.owner_user_id:
+        if (
+            user_id != config.owner_user_id
+            and user_id not in config.get_allowed_to_use_user_ids()
+        ):
             user = await bot_client.get_entity(user_id)
             await bot_client.send_message(
                 config.owner_user_id,
