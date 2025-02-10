@@ -8,13 +8,39 @@ from subscription import Sink
 api_id = os.getenv("API_ID")
 api_hash = os.getenv("API_HASH")
 bot_token = os.getenv("BOT_TOKEN")
+owner_user_id = int(os.getenv("OWNER_USER_ID", "0"))
 data_path = pathlib.Path("data")
+
+
+def v_name(fstr: str) -> str:
+    return fstr.split("=", 2)[0]
+
+
+not_overridable_properties = {
+    v_name(f"{api_id=}"),
+    v_name(f"{api_hash=}"),
+    v_name(f"{bot_token=}"),
+    v_name(f"{owner_user_id=}"),
+    v_name(f"{data_path=}"),
+}
+
 qr_login_wait_seconds = 60
 user_client_check_period_seconds = 10
 dialog_list_page_size = 10
-max_queue_workers = 3
 
-owner_user_id = int(os.getenv("OWNER_USER_ID", "0"))
+
+def override():
+    overrides = {}
+    override_from = data_path.joinpath("config.py")
+    if override_from.exists():
+        exec(override_from.read_text(), locals=overrides)
+    for override_key, override_value in filter(
+        lambda t: t[0] not in not_overridable_properties, overrides.items()
+    ):
+        globals()[override_key] = override_value
+
+
+override()
 
 
 def get_all_user_subscriptions(user_id: int) -> list[tuple[int, list[Sink]]]:
