@@ -1,4 +1,4 @@
-FROM python:3.12-slim as builder
+FROM python:3.12-slim AS builder
 
 # --- Install Poetry ---
 ARG POETRY_VERSION=1.8.5
@@ -26,7 +26,7 @@ RUN poetry install --no-root && rm -rf $POETRY_CACHE_DIR
 
 # Now let's build the runtime image from the builder.
 #   We'll just copy the env and the PATH reference.
-FROM python:3.12-slim as runtime
+FROM python:3.12-slim AS runtime
 
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
