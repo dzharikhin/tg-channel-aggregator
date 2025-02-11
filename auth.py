@@ -118,7 +118,7 @@ class UserClientState:
             )
         except Exception as e:
             logger.error(
-                f"Logging at auth user {user_id}, resetting to unauthorized", e
+                f"Logging at auth user {user_id}, resetting to unauthorized", exc_info=e
             )
             if not user_client:
                 user_client = await init_user_client(user_id)
