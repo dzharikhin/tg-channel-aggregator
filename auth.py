@@ -13,7 +13,7 @@ from persistqueue import SQLiteAckQueue
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.custom import QRLogin
-from telethon.tl.types import DocumentAttributeFilename, Message
+from telethon.tl.types import Message
 
 import config
 from common import is_debug
@@ -27,7 +27,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.DEBUG)
 
 
-def _render_qr(data: str, user_id: int) -> bytes:
+def _render_qr(data: str, user_id: int) -> tuple[bytes, int]:
     qr = qrcode.main.QRCode(
         version=3,
         box_size=20,
@@ -42,7 +42,7 @@ def _render_qr(data: str, user_id: int) -> bytes:
     buf = io.BytesIO()
     img.save(buf)
     buf.seek(0)
-    return buf.read()
+    return buf.read(), img.width
 
 
 @dataclasses.dataclass
@@ -157,23 +157,23 @@ class NotAuthorizedClient(UserClientState):
         if not self.user_client.is_connected():
             await self.user_client.connect()
         qr_login = await self.user_client.qr_login()
-        img_bytes = _render_qr(qr_login.url, user_id)
+        created_at = datetime.datetime.now().astimezone()
+        img_bytes, _ = _render_qr(qr_login.url, user_id)
+        file = await self._bot_client.upload_file(img_bytes, file_name="login_qr.png")
         if not self.auth_message:
             self.auth_message = await self._bot_client.send_message(
                 user_id,
-                f"created at {datetime.datetime.now():%H-%M-%S}. Actual for {config.qr_login_wait_seconds} seconds. "
+                f"created at {created_at:%H-%M-%S%Z}. Actual for {config.qr_login_wait_seconds} seconds. "
                 f"Open the image on a device that can be scanned with mobile Telegram scanner: Settings > Devices > Link Device",
-                file=img_bytes,
-                attributes=[DocumentAttributeFilename("login_qr.png")],
+                file=file,
             )
         else:
             await self._bot_client.edit_message(
                 user_id,
                 self.auth_message,
-                f"created at {datetime.datetime.now():%H-%M-%S}. Actual for {config.qr_login_wait_seconds} seconds. "
+                f"created at {created_at:%H-%M-%S%Z}. Actual for {config.qr_login_wait_seconds} seconds. "
                 f"Open the image on a device that can be scanned with mobile Telegram scanner: Settings > Devices > Link Device",
-                file=img_bytes,
-                attributes=[DocumentAttributeFilename("login_qr.png")],
+                file=file,
             )
         return TransitionStatus(
             QrAuthorizationWaitingClient(qr_login, self.auth_message, self), True
