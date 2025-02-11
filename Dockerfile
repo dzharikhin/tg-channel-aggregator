@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM python:3.12.9-bullseye AS builder
+FROM python:3.12.9-bullseye AS builder
 
 # --- Install Poetry ---
 ARG POETRY_VERSION=1.8.5
@@ -11,7 +11,7 @@ ENV PYTHONUNBUFFERED=1
 # Tell Poetry where to place its cache and virtual environment
 ENV POETRY_CACHE_DIR=/opt/.cache
 
-RUN pip install "poetry==${POETRY_VERSION}"
+RUN pip install -U pip && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . $HOME/.cargo/env && pip install "poetry==${POETRY_VERSION}"
 
 WORKDIR /app
 
@@ -32,7 +32,7 @@ ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 
 COPY --from=builder ${VIRTUAL_ENV} ${VIRTUAL_ENV}
-COPY *.py /app
+COPY *.py /app/
 
 # ENV API_HASH
 # ENV API_ID
