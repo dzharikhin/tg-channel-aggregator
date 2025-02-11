@@ -281,6 +281,8 @@ class PasswordAuthorizationWaitingClient(UserClientState):
     async def transition(self, user_id: int, event) -> TransitionStatus:
         if await self.user_client.is_user_authorized():
             return TransitionStatus(AuthorizedClient(user_id, self), True)
+        if not event:
+            return TransitionStatus(self, False)
         encrypted_ = event.message.message.strip()
         await self._bot_client.delete_messages(
             user_id, [self.public_key_msg_id, event.message.id]
