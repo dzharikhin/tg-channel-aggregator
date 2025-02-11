@@ -225,12 +225,12 @@ class QrAuthorizationWaitingClient(UserClientState):
             )
             return TransitionStatus(AuthorizedClient(user_id, self), True)
         except TimeoutError as e:
-            logger.info("Qr auth timeout exception, recreating qr", e)
+            logger.info("Qr auth timeout exception, recreating qr", exc_info=e)
             return TransitionStatus(
                 NotAuthorizedClient(self._auth_message, from_state=self), True
             )
         except SessionPasswordNeededError as e:
-            logger.info("2FA password required", e)
+            logger.info("2FA password required", exc_info=e)
             await self._bot_client.delete_messages(
                 user_id, message_ids=[self._auth_message.id]
             )
@@ -288,7 +288,10 @@ class PasswordAuthorizationWaitingClient(UserClientState):
         try:
             payload = _decode(encrypted_, self._secret_key.pop())
         except ValueError as e:
-            logger.warning("Password input was not encrypted with current PK", e)
+            logger.warning(
+                "Password input was not encrypted with current PK",
+                exc_info=e,
+            )
             await self._bot_client.send_message(
                 user_id, "Password was not encrypted with public key. Lets try again"
             )

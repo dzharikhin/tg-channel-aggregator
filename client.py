@@ -48,7 +48,10 @@ async def check_clients_consistency(
         try:
             await ensure_clients_consistency(user_clients, tasks, bot_client)
         except RPCError as e:
-            logger.warning(f"Exception on consistency check for {user_id}, continue", e)
+            logger.warning(
+                f"Exception on consistency check for {user_id}, continue",
+                exc_info=e,
+            )
             await bot_client.send_message(
                 config.owner_user_id, "exception on consistency check"
             )
@@ -95,11 +98,17 @@ async def handle_queue_tasks(
                 raise ValueError(f"unknown cmd: {cmd}")
         except (ValueError, BadRequestError) as e:
             cmd_id = queue.ack_failed(cmd)
-            logger.warning(f"cannot handle {cmd_id}: {cmd} - marked as failed", e)
+            logger.warning(
+                f"cannot handle {cmd_id}: {cmd} - marked as failed",
+                exc_info=e,
+            )
             await bot_client.send_message(user_id, f"Failed to execute {cmd}: {e}")
         except RPCError as e:
             cmd_id = queue.nack(cmd)
-            logger.info(f"{cmd_id}: {cmd} - failed with {type(e)}, going to retry", e)
+            logger.info(
+                f"{cmd_id}: {cmd} - failed with {type(e)}, going to retry",
+                exc_info=e,
+            )
 
 
 async def ensure_clients_consistency(
@@ -378,7 +387,7 @@ async def main():
                         f"Invalid channels: {invalid_channels}, invalid offsets: {invalid_offsets}"
                     )
             except ValueError as e:
-                logger.info(f"Error on parsing {mapping}", e)
+                logger.info(f"Error on parsing {mapping}", exc_info=e)
                 event.reply(
                     'Argument must be valid json: {"channel_key": [msg_id]/"full"}'
                 )
