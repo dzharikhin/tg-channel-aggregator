@@ -24,7 +24,6 @@ not_overridable_properties = {
     v_name(f"{data_path=}"),
 }
 
-qr_login_wait_seconds = 60
 user_client_check_period_seconds = 10
 dialog_list_page_size = 10
 

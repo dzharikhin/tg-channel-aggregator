@@ -1,5 +1,4 @@
 import dataclasses
-import datetime
 import io
 import logging
 import pathlib
@@ -138,12 +137,14 @@ class NotAuthorizedClient(UserClientState):
     def __init__(
         self,
         auth_message: Optional[Message] = None,
+        qr_login: Optional[QRLogin] = None,
         *,
         from_state: Optional[UserClientState] = None,
         user_client: Optional[TelegramClient] = None,
         bot_client: Optional[TelegramClient] = None,
     ):
         self.auth_message = auth_message
+        self._qr_login = qr_login
         if from_state:
             self._bot_client = from_state._bot_client
             self.user_client = from_state.user_client
@@ -156,14 +157,17 @@ class NotAuthorizedClient(UserClientState):
             return TransitionStatus(AuthorizedClient(user_id, self), True)
         if not self.user_client.is_connected():
             await self.user_client.connect()
-        qr_login = await self.user_client.qr_login()
-        created_at = datetime.datetime.now().astimezone()
-        img_bytes, _ = _render_qr(qr_login.url, user_id)
+
+        if not self._qr_login:
+            self._qr_login = await self.user_client.qr_login()
+        else:
+            await self._qr_login.recreate()
+        img_bytes, _ = _render_qr(self._qr_login.url, user_id)
         file = await self._bot_client.upload_file(img_bytes, file_name="login_qr.png")
         if not self.auth_message:
             self.auth_message = await self._bot_client.send_message(
                 user_id,
-                f"created at {created_at:%H-%M-%S%Z}. Actual for {config.qr_login_wait_seconds} seconds. "
+                f"Actual until {self._qr_login.expires:%H-%M-%S%Z}. Then new code is generated"
                 f"Open the image on a device that can be scanned with mobile Telegram scanner: Settings > Devices > Link Device",
                 file=file,
             )
@@ -171,12 +175,12 @@ class NotAuthorizedClient(UserClientState):
             await self._bot_client.edit_message(
                 user_id,
                 self.auth_message,
-                f"created at {created_at:%H-%M-%S%Z}. Actual for {config.qr_login_wait_seconds} seconds. "
+                f"Actual until {self._qr_login.expires:%H-%M-%S%Z}. Then new code is generated"
                 f"Open the image on a device that can be scanned with mobile Telegram scanner: Settings > Devices > Link Device",
                 file=file,
             )
         return TransitionStatus(
-            QrAuthorizationWaitingClient(qr_login, self.auth_message, self), True
+            QrAuthorizationWaitingClient(self._qr_login, self.auth_message, self), True
         )
 
 
@@ -215,7 +219,7 @@ class QrAuthorizationWaitingClient(UserClientState):
         if await self.user_client.is_user_authorized():
             return TransitionStatus(AuthorizedClient(user_id, self), True)
         try:
-            await self._qr_login.wait(config.qr_login_wait_seconds)
+            await self._qr_login.wait()
             await self._bot_client.delete_messages(
                 user_id, message_ids=[self._auth_message.id]
             )
