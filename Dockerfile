@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS builder
+FROM --platform=$BUILDPLATFORM python:3.12.9-bullseye AS builder
 
 # --- Install Poetry ---
 ARG POETRY_VERSION=1.8.5
@@ -22,11 +22,11 @@ COPY pyproject.toml poetry.lock /app/
 
 # Install the dependencies and clear the cache afterwards.
 #   This may save some MBs.
-RUN poetry install --no-root && rm -rf $POETRY_CACHE_DIR
+RUN poetry -vv install --no-root && rm -rf $POETRY_CACHE_DIR
 
 # Now let's build the runtime image from the builder.
 #   We'll just copy the env and the PATH reference.
-FROM python:3.12-slim AS runtime
+FROM python:3.12.9-bullseye AS runtime
 
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
