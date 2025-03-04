@@ -67,7 +67,7 @@ async def handle_queue_tasks(
     while True:
         cmd = None
         try:
-            cmd = await asyncio.to_thread(queue.get)
+            cmd = queue.get_nowait()
             if "sync" == cmd["cmd"]:
                 channel_id = cmd["channel_id"]
                 channel = unwrap_single_chat(
@@ -96,6 +96,8 @@ async def handle_queue_tasks(
                 queue.ack(cmd)
             else:
                 raise ValueError(f"unknown cmd: {cmd}")
+        except persistqueue.exceptions.Empty:
+            await asyncio.sleep(1)
         except (ValueError, BadRequestError) as e:
             cmd_id = queue.ack_failed(cmd)
             logger.warning(

@@ -82,7 +82,11 @@ async def new_message_in_target_channel_handler(
 
 
 async def forward_to_sinks(
-    user_id, user_client, message, sinks_for_channel, bot_client
+    user_id,
+    user_client: TelegramClient,
+    message: custom.Message,
+    sinks_for_channel,
+    bot_client: TelegramClient,
 ):
     for sink in sinks_for_channel:
         if not sink.filter_message(message):
@@ -91,7 +95,11 @@ async def forward_to_sinks(
             )
             continue
         try:
-            result = await user_client.forward_messages(sink.id, message)
+            result = await user_client.send_file(
+                sink.id,
+                message.media,
+                caption=f"https://t.me/c/{message.peer_id.channel_id}/{message.id}",
+            )
             logging.debug(f"Forwarded {message} to {sink} with result {result}")
         except RPCError as e:
             logger.warning(
