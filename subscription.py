@@ -34,13 +34,19 @@ class Mp3Filter(Filter):
         self.max_length_seconds = params["max_seconds"]
 
     def filter_message(self, message) -> bool:
+        if not message:
+            return False
         if not isinstance(message, (telethon.tl.types.Message, custom.Message)):
             return False
-        if not message.media or not message.media.document:
+        if isinstance(message, telethon.tl.types.MessageMediaPhoto):
             return False
-        if message.media.document.mime_type not in {"audio/mpeg", "audio/mp3"}:
+        if not hasattr(message, "media") or not hasattr(message.media, "document"):
             return False
-        if not message.media.document.attributes or not [
+        if not hasattr(
+            message.media.document, "mime_type"
+        ) or message.media.document.mime_type not in {"audio/mpeg", "audio/mp3"}:
+            return False
+        if not hasattr(message.media.document, "attributes") or not [
             audio_attr := cast(DocumentAttributeAudio, attr)
             for attr in message.media.document.attributes
             if isinstance(attr, DocumentAttributeAudio)
