@@ -9,7 +9,7 @@ VER=$(poetry version --short) docker buildx bake --progress=plain tg-channel-agg
 ```
 ## Run
 ```shell
-API_HASH= API_ID= BOT_TOKEN= OWNER_USER_ID= docker run --rm -d --restart unless-stopped --name "tg-channel-aggregator" -v "./data:/app/data" --env API_HASH --env API_ID --env BOT_TOKEN --env OWNER_USER_ID "tg-channel-aggregator:$(poetry version --short)"
+API_HASH= API_ID= BOT_TOKEN= OWNER_USER_ID= docker run --rm -d --restart unless-stopped --name "tg-channel-aggregator" -v "./data:/app/data" --env API_HASH --env API_ID --env BOT_TOKEN --env OWNER_USER_ID --memory=1G  --cpus=2 "tg-channel-aggregator:$(poetry version --short)"
 ```
 ## Export
 ```shell
