@@ -1,8 +1,11 @@
 import asyncio
+import io
 import json
 import logging
 import re
+from argparse import ArgumentParser, ArgumentTypeError, Namespace, ArgumentError
 from asyncio import Future, Task
+from functools import partial
 from types import CoroutineType
 from typing import Optional, cast
 
@@ -175,11 +178,142 @@ def unwrap_single_chat(chat: Chats) -> Optional[Chat]:
     return chat.chats[0]
 
 
-START_CMD = "(?i)^/start"
-LIST_CMD = "(?i)^/list"
-SUBSCRIBE_CMD = "(?i)^/subscribe (-?\\d+) (-?\\d+) ([\\S]+) ({.+})"
-UNSUBSCRIBE_CMD = "(?i)^/unsubscribe (-?\\d+) (-?\\d+)"
-SYNC_CMD = "(?i)^/sync ({.+})"
+def jsonarg(arg: str) -> str:
+    try:
+        json.loads(arg)
+        return arg
+    except json.JSONDecodeError:
+        raise ArgumentTypeError(f"{arg} is not a valid json")
+
+
+def syncpairarg(err_msg: str, arg: str) -> tuple[int | str, int | str]:
+    k, v = tuple(arg.split("="))
+    if re.match("\\d+", k):
+        k = int(k)
+    if re.match("\\d+", v):
+        v = int(v)
+    if not isinstance(k, int) and k != "all" or not isinstance(v, int) and v != "full":
+        raise ArgumentTypeError(err_msg)
+
+    return k, v
+
+
+START_CMD = ArgumentParser(
+    prog="start",
+    epilog="(?i)^/start.*$",
+    description="print available commands",
+    exit_on_error=False,
+    add_help=False,
+)
+LIST_CMD = (
+    parser := ArgumentParser(
+        prog="list",
+        epilog="(?i)^/list(.*)$",
+        description="list channels\subscriptions",
+        exit_on_error=False,
+        add_help=False,
+    ),
+    parser.add_argument(
+        "--subs",
+        action="store_true",
+        help="list subscriptions only",
+    ),
+    parser,
+)[-1]
+SUBSCRIBE_CMD = (
+    parser := ArgumentParser(
+        prog="subscribe",
+        epilog="(?i)^/subscribe(.*)$",
+        description="create forwarding route",
+        exit_on_error=False,
+        add_help=False,
+    ),
+    parser.add_argument(
+        "-s",
+        "--src_channel_id",
+        required=True,
+        type=int,
+        help="channel to listen messages from",
+    ),
+    parser.add_argument(
+        "-d",
+        "--dst_channel_id",
+        required=True,
+        type=int,
+        help="channel to sink messages to",
+    ),
+    parser.add_argument(
+        "-f",
+        "--filter_type",
+        required=True,
+        type=str,
+        choices=["mp3"],
+        help="source filter type",
+    ),
+    parser.add_argument(
+        "-p",
+        "--filter_params",
+        required=True,
+        type=jsonarg,
+        choices=["mp3"],
+        help="params for filter. must be a valid JSON",
+    ),
+    parser,
+)[-1]
+UNSUBSCRIBE_CMD = (
+    parser := ArgumentParser(
+        prog="unsubscribe",
+        epilog="(?i)^/unsubscribe(.*)$",
+        description="create forwarding route",
+        exit_on_error=False,
+        add_help=False,
+    ),
+    parser.add_argument(
+        "-s",
+        "--src_channel_id",
+        required=True,
+        type=int,
+        help="channel to listen messages from",
+    ),
+    parser.add_argument(
+        "-d",
+        "--dst_channel_id",
+        required=True,
+        type=int,
+        help="channel to sink messages to",
+    ),
+    parser,
+)[-1]
+SYNC_CMD = (
+    parser := ArgumentParser(
+        prog="sync",
+        epilog="(?i)^/sync(.*)$",
+        description="sync messages in subscription\-s",
+        exit_on_error=False,
+        add_help=False,
+    ),
+    pair_help := 'space-separated pairs <channel>=<offset>: channel must be <channel_id> or "all", offset must be <from_offset_msg_id> or "full"',
+    parser.add_argument(
+        "--pairs",
+        required=True,
+        type=partial(syncpairarg, pair_help),
+        nargs="+",
+        help=pair_help,
+    ),
+    parser,
+)[-1]
+
+
+def _parse_args(
+    arg_parser: ArgumentParser, cmd_line: str
+) -> tuple[Namespace | None, str | None]:
+    try:
+        args = arg_parser.parse_args(cmd_line.split())
+        return args, None
+    except ArgumentError as e:
+        buffer = io.StringIO()
+        arg_parser.print_usage(buffer)
+        return None, buffer.getvalue()
 
 
 def not_matched_command(txt: str) -> bool:
@@ -187,11 +321,11 @@ def not_matched_command(txt: str) -> bool:
         (
             re.match(pattern, txt)
             for pattern in (
-                START_CMD,
-                LIST_CMD,
-                SUBSCRIBE_CMD,
-                UNSUBSCRIBE_CMD,
-                SYNC_CMD,
+                START_CMD.epilog,
+                LIST_CMD.epilog,
+                SUBSCRIBE_CMD.epilog,
+                UNSUBSCRIBE_CMD.epilog,
+                SYNC_CMD.epilog,
             )
         )
     )
@@ -210,7 +344,7 @@ async def main():
         user_client_registry = await launch_current_users(bot_client)
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=not_matched_command))
-        @bot_client.on(events.NewMessage(incoming=True, pattern=START_CMD))
+        @bot_client.on(events.NewMessage(incoming=True, pattern=START_CMD.epilog))
         async def list_channels_handler(event: NewMessage.Event):
             if not (
                 await UserClientState.get_or_create_client(
@@ -219,11 +353,13 @@ async def main():
             ):
                 return
             logger.debug(f"Received unknown command: <{event.message.message}>")
-            await event.respond(
-                "/list - to list your channels\n/subscribe - to create/edit subscription\n/unsubscribe - to remove subscription\n/sync - to sync some channels historical data",
-            )
+            buffer = io.StringIO()
+            for cmd in [LIST_CMD, SUBSCRIBE_CMD, UNSUBSCRIBE_CMD, SYNC_CMD]:
+                buffer.write(f"/{cmd.prog}\n")
+                cmd.print_usage(buffer)
+            await event.respond(buffer.getvalue())
 
-        @bot_client.on(events.NewMessage(incoming=True, pattern=LIST_CMD))
+        @bot_client.on(events.NewMessage(incoming=True, pattern=LIST_CMD.epilog))
         async def list_channels_handler(event: NewMessage.Event):
             if not (
                 state := await UserClientState.get_or_create_client(
@@ -232,7 +368,14 @@ async def main():
             ):
                 return
 
-            if "subs" == event.text.removeprefix("/list").strip():
+            args, help_to_print = _parse_args(
+                LIST_CMD, event.pattern_match.group(1).strip()
+            )
+            if help_to_print:
+                await event.respond(help_to_print)
+                return
+
+            if args.subs:
                 message_text, buttons, (pagination_data, attributes) = (
                     await build_subscribed_channel_response(
                         event.sender_id, state.user_client, []
@@ -306,7 +449,7 @@ async def main():
                 buttons=buttons,
             )
 
-        @bot_client.on(events.NewMessage(incoming=True, pattern=SUBSCRIBE_CMD))
+        @bot_client.on(events.NewMessage(incoming=True, pattern=SUBSCRIBE_CMD.epilog))
         async def subscribe_handler(event: NewMessage.Event):
             if not (
                 state := await UserClientState.get_or_create_client(
@@ -314,34 +457,40 @@ async def main():
                 )
             ):
                 return
-            source_channel_id = event.pattern_match.group(1).strip()
-            sink_channel_id = event.pattern_match.group(2).strip()
-            filter_type = event.pattern_match.group(3).strip()
-            filter_params = event.pattern_match.group(4).strip()
+
+            args, help_to_print = _parse_args(
+                SUBSCRIBE_CMD, event.pattern_match.group(1).strip()
+            )
+            if help_to_print:
+                await event.respond(help_to_print)
+                return
+
             logger.debug(
-                f"subscribing user {event.sender_id}: {source_channel_id=} -> {sink_channel_id} with filter {filter_type}({filter_params})"
+                f"subscribing user {event.sender_id}: {args.src_channel_id} -> {args.dst_channel_id} with filter {args.filter_type}({args.filter_params})"
             )
             channel = unwrap_single_chat(
-                await state.user_client(GetChannelsRequest(id=[int(sink_channel_id)]))
+                await state.user_client(GetChannelsRequest(id=[args.dst_channel_id]))
             )
             if not has_send_message_permission(channel):
                 await event.respond(
-                    f"You have no permission to send messages in {sink_channel_id}"
+                    f"You have no permission to send messages in {args.dst_channel_id}"
                 )
                 return
 
             config.create_subscription(
                 event.sender_id,
-                source_channel_id,
-                (sink_channel_id, channel.title),
-                (filter_type, filter_params),
+                args.src_channel_id,
+                (args.dst_channel_id, channel.title),
+                (args.filter_type, args.filter_params),
             )
             subscribe_to_channel(
-                event.sender_id, state.user_client, source_channel_id, bot_client
+                event.sender_id, state.user_client, args.src_channel_id, bot_client
             )
-            await event.respond(f"subscribed {source_channel_id} -> {sink_channel_id}")
+            await event.respond(
+                f"subscribed {args.src_channel_id} -> {args.dst_channel_id}"
+            )
 
-        @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD))
+        @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD.epilog))
         async def unsubscribe_handler(event: NewMessage.Event):
             if not (
                 state := await UserClientState.get_or_create_client(
@@ -349,22 +498,28 @@ async def main():
                 )
             ):
                 return
-            source_channel_id = event.pattern_match.group(1).strip()
-            sink_channel_id = event.pattern_match.group(2).strip()
+
+            args, help_to_print = _parse_args(
+                UNSUBSCRIBE_CMD, event.pattern_match.group(1).strip()
+            )
+            if help_to_print:
+                await event.respond(help_to_print)
+                return
+
             logger.debug(
-                f"unsubscribing user {event.sender_id}: {source_channel_id=} -> {sink_channel_id}"
+                f"unsubscribing user {event.sender_id}: {args.src_channel_id=} -> {args.dst_channel_id}"
             )
             if config.remove_subscription(
-                event.sender_id, source_channel_id, sink_channel_id
+                event.sender_id, args.src_channel_id, args.dst_channel_id
             ):
                 unsubscribe_from_channel(
-                    state.user_client, source_channel_id, bot_client
+                    state.user_client, args.src_channel_id, bot_client
                 )
             await event.respond(
-                f"unsubscribed {source_channel_id} -> {sink_channel_id}"
+                f"unsubscribed {args.src_channel_id} -> {args.dst_channel_id}"
             )
 
-        @bot_client.on(events.NewMessage(incoming=True, pattern=SYNC_CMD))
+        @bot_client.on(events.NewMessage(incoming=True, pattern=SYNC_CMD.epilog))
         async def sync_handler(event: NewMessage.Event):
             if not (
                 state := await UserClientState.get_or_create_client(
@@ -373,36 +528,21 @@ async def main():
             ):
                 return
 
-            mapping = event.pattern_match.group(1).strip()
-            try:
-                mapping = json.loads(mapping)
-                invalid_channels = [
-                    k for k in mapping.keys() if (not isinstance(k, int) and k != "all")
-                ]
-                invalid_offsets = [
-                    v
-                    for v in mapping.values()
-                    if (not isinstance(v, int) and v != "full")
-                ]
-                if invalid_channels or invalid_offsets:
-                    raise ValueError(
-                        f"Invalid channels: {invalid_channels}, invalid offsets: {invalid_offsets}"
-                    )
-            except ValueError as e:
-                logger.info(f"Error on parsing {mapping}", exc_info=e)
-                event.reply(
-                    'Argument must be valid json: {"channel_key": [msg_id]/"full"}'
-                )
+            args, help_to_print = _parse_args(
+                SYNC_CMD, event.pattern_match.group(1).strip()
+            )
+            if help_to_print:
+                await event.respond(help_to_print)
                 return
 
+            mapping = dict(args.pairs)
             default_offset = mapping.pop("all", None)
-            task_dict = {int(k): v for k, v in mapping}
             if default_offset:
                 for channel_id, _ in config.get_all_user_subscriptions(event.sender_id):
-                    if channel_id not in task_dict:
-                        task_dict[channel_id] = default_offset
+                    if channel_id not in mapping:
+                        mapping[channel_id] = default_offset
 
-            for channel_id, offset in task_dict.items():
+            for channel_id, offset in mapping.items():
                 state.queue.put(
                     {"cmd": "sync", "channel_id": channel_id, "from": offset}
                 )
