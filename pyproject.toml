@@ -9,7 +9,7 @@ readme = "README.md"
 python = "^3.12"
 telethon = "^1.40.0"
 qrcode = "^8.2"
-pillow = "^11.2.1"
+pillow = "^11.3.0"
 eciespy = "^0.4.4"
 persist-queue = "^1.0.0"
 
