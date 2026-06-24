@@ -450,12 +450,12 @@ async def main():
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=SUBSCRIBE_CMD.epilog))
         async def subscribe_handler(event: NewMessage.Event):
-            # if not (
-            #     state := await UserClientState.get_or_create_client(
-            #         user_client_registry, bot_client, event.sender_id, event
-            #     )
-            # ):
-            #     return
+            if not (
+                state := await UserClientState.get_or_create_client(
+                    user_client_registry, bot_client, event.sender_id, event
+                )
+            ):
+                return
 
             args, help_to_print = _parse_args(
                 SUBSCRIBE_CMD, event.pattern_match.group(1).strip()
