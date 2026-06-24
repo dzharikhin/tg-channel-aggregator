@@ -4,15 +4,15 @@ import logging
 import pathlib
 from typing import Optional
 
+import coincurve
+import eth_keys
 import persistqueue.serializers.json
 import qrcode
 from ecies import decrypt, encrypt
-from ecies.utils import generate_eth_key
 from persistqueue import SQLiteAckQueue
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.custom import QRLogin
-from telethon.tl.types import Message
+from telethon.tl.custom import QRLogin, Message
 
 import config
 from common import is_debug
@@ -51,7 +51,7 @@ class Keys:
 
 
 def _generate_keys() -> Keys:
-    eth_k = generate_eth_key()
+    eth_k = eth_keys.keys.PrivateKey(coincurve.utils.get_valid_secret())
     keys = Keys(eth_k.to_hex(), eth_k.public_key.to_hex())
     return keys
 

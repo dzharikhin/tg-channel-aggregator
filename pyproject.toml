@@ -1,17 +1,19 @@
 [tool.poetry]
 name = "tg-channel-aggregator"
-version = "0.2.2"
+version = "0.2.3"
 description = "aggregate channels"
 authors = ["Dmitriy Zharikhin <dzharikhin>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.12"
-telethon = "^1.42.0"
+telethon = "^1.44.0"
 qrcode = "^8.2"
 eciespy = "^0.4.6"
 persist-queue = "^1.1.0"
 pillow = "^12.2.0"
+eth-keys = "^0.7.0"
+coincurve = "^21.0.0"
 
 
 [tool.poetry.group.dev.dependencies]
