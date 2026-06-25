@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import re
+import shlex
 from argparse import ArgumentParser, ArgumentTypeError, Namespace, ArgumentError
 from asyncio import Future, Task
 from functools import partial
@@ -307,11 +308,11 @@ def _parse_args(
     arg_parser: ArgumentParser, cmd_line: str
 ) -> tuple[Namespace | None, str | None]:
     try:
-        args = arg_parser.parse_args(cmd_line.split())
+        args = arg_parser.parse_args(shlex.split(cmd_line))
         return args, None
     except ArgumentError as e:
         buffer = io.StringIO()
-        arg_parser.print_usage(buffer)
+        arg_parser.print_help(buffer)
         return None, buffer.getvalue()
 
 

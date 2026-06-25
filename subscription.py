@@ -3,11 +3,10 @@ import logging
 from functools import partial
 from typing import cast, Any
 
-import telethon
-from telethon import events, TelegramClient, custom
+from telethon import events, TelegramClient
 from telethon.errors import RPCError
 from telethon.events import NewMessage
-from telethon.tl.types import DocumentAttributeAudio
+from telethon.tl.types import DocumentAttributeAudio, Message, MessageMediaPhoto
 
 import config
 
@@ -36,9 +35,9 @@ class Mp3Filter(Filter):
     def filter_message(self, message) -> bool:
         if not message:
             return False
-        if not isinstance(message, (telethon.tl.types.Message, custom.Message)):
+        if not isinstance(message, Message):
             return False
-        if isinstance(message, telethon.tl.types.MessageMediaPhoto):
+        if isinstance(message.media, MessageMediaPhoto):
             return False
         if not hasattr(message, "media") or not hasattr(message.media, "document"):
             return False
@@ -90,7 +89,7 @@ async def new_message_in_target_channel_handler(
 async def forward_to_sinks(
     user_id,
     user_client: TelegramClient,
-    message: custom.Message,
+    message: Message,
     sinks_for_channel,
     bot_client: TelegramClient,
 ):

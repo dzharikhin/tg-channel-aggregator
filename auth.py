@@ -12,7 +12,8 @@ from ecies import decrypt, encrypt
 from persistqueue import SQLiteAckQueue
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.custom import QRLogin, Message
+from telethon.tl.custom import QRLogin
+from telethon.tl.types import Message
 
 import config
 from common import is_debug
