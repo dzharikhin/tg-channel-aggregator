@@ -1,6 +1,17 @@
 # tg-channel-aggregator
 
 app to filter and aggregate content from multiple channels to single
+
+## Dev environment
+> requires installed [poetry](https://python-poetry.org/), python 3.14
+
+```shell
+poetry install
+poetry run pytest
+poetry run ruff check .
+poetry run black .
+```
+
 ## Build
 > requires installed [poetry](https://python-poetry.org/)
 

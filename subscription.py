@@ -1,9 +1,9 @@
 import json
 import logging
 from functools import partial
-from typing import cast, Any
+from typing import Any, cast
 
-from telethon import events, TelegramClient
+from telethon import TelegramClient, events
 from telethon.errors import RPCError
 from telethon.events import NewMessage
 from telethon.tl.types import DocumentAttributeAudio, Message, MessageMediaPhoto

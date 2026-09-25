@@ -4,7 +4,14 @@ __pycache__/
 .env.*
 .venv/
 .git/
+.idea/
+.opencode/
+.opencode.backup-*/
+data/
+tests/
+conftest.py
 *.pyc
 dist/
 build/
-.opencode/
+Dockerfile
+.dockerignore
