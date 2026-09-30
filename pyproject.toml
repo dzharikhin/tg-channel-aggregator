@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "tg-channel-aggregator"
-version = "0.3.0"
+version = "0.3.1"
 description = "aggregate channels"
 authors = ["Dmitriy Zharikhin <dzharikhin>"]
 readme = "README.md"

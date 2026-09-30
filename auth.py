@@ -87,7 +87,7 @@ class UserAuthMachine(StateChart):
     auth_missing = authorized.to(idle)
     start_auth = idle.to(qr_sent)
     qr_expired = qr_sent.to(qr_sent)
-    password_needed = qr_sent.to(password_wait)
+    password_needed = idle.to(password_wait) | qr_sent.to(password_wait)
     password_bad = password_wait.to(password_wait)
     reset = (
         idle.to(idle) | qr_sent.to(idle) | password_wait.to(idle) | authorized.to(idle)
@@ -101,6 +101,7 @@ class UserAuthMachine(StateChart):
         self._qr_task: Optional[asyncio.Task] = None
         self._pending_keys: Optional[Keys] = None
         self._pk_message_id: Optional[int] = None
+        self._password_fallback_task: Optional[asyncio.Task] = None
 
     @property
     def is_authorized(self) -> bool:
@@ -110,10 +111,21 @@ class UserAuthMachine(StateChart):
         user_id = self.session.user_id
         if not self.session.user_client.is_connected():
             await self.session.user_client.connect()
-        if self._qr_login is None:
-            self._qr_login = await self.session.user_client.qr_login()
-        else:
-            await self._qr_login.recreate()
+        try:
+            if self._qr_login is None:
+                self._qr_login = await self.session.user_client.qr_login()
+            else:
+                await self._qr_login.recreate()
+        except SessionPasswordNeededError:
+            # the code was already scanned and the account has 2FA: the server
+            # keeps a pending login awaiting the password and every further
+            # exportLoginToken raises until it is entered, so ask for the
+            # password instead of looping on qr generation. deferred because
+            # sending an event from inside the processing loop would deadlock
+            self._password_fallback_task = asyncio.ensure_future(
+                self._fallback_to_password_wait()
+            )
+            return
         img_bytes, _ = _render_qr(self._qr_login.url, user_id)
         file = await self.session.bot_client.upload_file(
             img_bytes, file_name="login_qr.png"
@@ -140,6 +152,19 @@ class UserAuthMachine(StateChart):
         task, self._qr_task = self._qr_task, None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
+
+    async def _fallback_to_password_wait(self) -> None:
+        try:
+            await self.send("password_needed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # ticks will retry qr_expired, which re-schedules this fallback
+            logger.error(
+                f"failed to dispatch password_needed fallback for user "
+                f"{self.session.user_id}",
+                exc_info=e,
+            )
 
     async def _await_qr_scan(self) -> None:
         try:
@@ -288,6 +313,8 @@ class AuthManager:
         for machine in self._machines.values():
             if machine._qr_task is not None:
                 machine._qr_task.cancel()
+            if machine._password_fallback_task is not None:
+                machine._password_fallback_task.cancel()
             await machine.session.user_client.disconnect()
 
     async def _authorize_if_possible(self, machine: UserAuthMachine) -> bool:

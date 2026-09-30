@@ -1,7 +1,10 @@
 import asyncio
 
 import pytest
-from telethon.errors import PasswordHashInvalidError
+from telethon.errors import (
+    PasswordHashInvalidError,
+    SessionPasswordNeededError,
+)
 from test_auth_machine import FakeBotClient, FakeUserClient
 
 import auth
@@ -94,6 +97,44 @@ async def test_ensure_authorized_starts_qr_flow_for_unauthorized(manager, bot):
     assert len(bot.sent) == 1
 
 
+async def test_tick_stuck_in_qr_sent_with_2fa_falls_back_to_password_wait(manager, bot):
+    # deployment scenario: code was scanned after the waiter died, every tick
+    # retried qr_expired and recreate() kept raising SessionPasswordNeededError
+    await manager.ensure_authorized(100)  # qr_sent
+    machine = manager._machines[100]
+    machine._qr_task.cancel()
+    await asyncio.sleep(0.05)  # waiter is dead now
+    machine._qr_login._recreate_error = SessionPasswordNeededError(request=None)
+    machine._qr_login._recreate_error_times = 99
+
+    assert await manager.ensure_authorized(100) is None
+    await eventually_in_state(machine, machine.password_wait)
+    assert any("Password is required" in t for t in texts(bot))
+
+    keys = machine._pending_keys
+    ev = AuthEvent(77, ecies_compat.encrypt(keys.pk, b"top-secret-2fa").hex())
+    session = await manager.feed_message(100, ev)
+    assert session is not None
+    assert machine.is_authorized
+
+
+async def test_tick_after_restart_with_pending_2fa_goes_to_password_wait(
+    manager, bot, monkeypatch
+):
+    # fresh process, server-side 2FA session still pending: start_auth itself
+    # must not loop on qr generation
+    async def password_waiting_client(user_id):
+        return FakeUserClient(qr_login_error=SessionPasswordNeededError(request=None))
+
+    monkeypatch.setattr(auth, "init_user_client", password_waiting_client)
+
+    assert await manager.ensure_authorized(100) is None
+    machine = manager._machines[100]
+    await eventually_in_state(machine, machine.password_wait)
+    assert not any("Actual until" in t for t in texts(bot))
+    assert any("Password is required" in t for t in texts(bot))
+
+
 async def test_dead_qr_waiter_is_revived_on_tick(manager, bot):
     await manager.ensure_authorized(100)
     machine = manager._machines[100]
@@ -117,6 +158,16 @@ async def eventually_authorized(machine, timeout=2.0):
             return
         await asyncio.sleep(0.01)
     pytest.fail("machine did not become authorized")
+
+
+async def eventually_in_state(machine, state, timeout=2.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if state in machine.configuration:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail(f"machine did not reach state {state.name}")
 
 
 async def test_feed_message_ignores_unrelated_states(manager, bot):

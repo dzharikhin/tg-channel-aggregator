@@ -8,17 +8,30 @@ from auth import UserAuthMachine, UserSession
 
 
 class FakeQRLogin:
-    def __init__(self, wait_result=None, wait_error=None, hang=False, error_times=1):
+    def __init__(
+        self,
+        wait_result=None,
+        wait_error=None,
+        hang=False,
+        error_times=1,
+        recreate_error=None,
+        recreate_error_times=1,
+    ):
         self.url = "tg://login?token=fake"
         self.expires = datetime.datetime(2026, 1, 1, 12, 0, 0)
         self.recreated = 0
         self._wait_result = wait_result
         self._wait_error = wait_error
         self._error_times = error_times
+        self._recreate_error = recreate_error
+        self._recreate_error_times = recreate_error_times
         self._hang = hang
 
     async def recreate(self):
         self.recreated += 1
+        if self._recreate_error is not None and self._recreate_error_times > 0:
+            self._recreate_error_times -= 1
+            raise self._recreate_error
 
     async def wait(self):
         if self._wait_error is not None and self._error_times > 0:
@@ -30,9 +43,10 @@ class FakeQRLogin:
 
 
 class FakeUserClient:
-    def __init__(self, qr_login=None, authorized=False):
+    def __init__(self, qr_login=None, authorized=False, qr_login_error=None):
         self.authorized = authorized
         self.qr_login_result = qr_login or FakeQRLogin(hang=True)
+        self.qr_login_error = qr_login_error
         self.connect_calls = 0
 
     def is_connected(self):
@@ -45,6 +59,8 @@ class FakeUserClient:
         return self.authorized
 
     async def qr_login(self):
+        if self.qr_login_error is not None:
+            raise self.qr_login_error
         return self.qr_login_result
 
     async def sign_in(self, password=None):
@@ -161,6 +177,37 @@ async def test_password_needed_flow(session):
     assert len(session.bot_client.sent) == 2
     assert "Password is required" in session.bot_client.sent[1].message
     assert session.bot_client.sent[1].message.count(machine._pending_keys.pk) == 1
+
+
+async def test_qr_expired_recreation_hitting_2fa_goes_to_password_wait(session):
+    # code was scanned while nobody was waiting: the waiter times out, but then
+    # every exportLoginToken raises SessionPasswordNeededError until the
+    # password is entered, so the machine must route into password_wait
+    session.user_client.qr_login_result = FakeQRLogin(
+        wait_error=TimeoutError(),
+        recreate_error=SessionPasswordNeededError(request=None),
+        recreate_error_times=99,
+    )
+    machine = UserAuthMachine(session)
+    await machine.send("start_auth")
+
+    await eventually(
+        lambda: "password_wait" in states(machine),
+        "failed qr recreation must fall back to password_needed",
+    )
+    assert session.bot_client.deleted == [1]
+    assert "Password is required" in session.bot_client.sent[-1].message
+
+
+async def test_password_needed_reachable_from_idle(session):
+    # after a restart the pending 2FA login on the server is still there even
+    # though this machine never sent a qr in this process
+    machine = UserAuthMachine(session)
+    await machine.send("password_needed")
+
+    assert states(machine) == {"password_wait"}
+    assert machine._pending_keys is not None
+    assert "Password is required" in session.bot_client.sent[0].message
 
 
 async def test_password_bad_regenerates_keys(session):
