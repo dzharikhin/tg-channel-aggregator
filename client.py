@@ -22,6 +22,7 @@ import config
 from auth import AuthManager
 from channels import build_all_channel_response, build_subscribed_channel_response
 from subscription import (
+    CAPTION_MODES,
     forward_to_sinks,
     subscribe_to_channel,
     unsubscribe_from_channel,
@@ -233,7 +234,7 @@ SUBSCRIBE_CMD = (
         "--filter_type",
         required=True,
         type=str,
-        choices=["mp3"],
+        choices=["mp3", "hashtag"],
         help="source filter type",
     ),
     parser.add_argument(
@@ -242,6 +243,15 @@ SUBSCRIBE_CMD = (
         required=True,
         type=jsonarg,
         help="params for filter. must be a valid JSON",
+    ),
+    parser.add_argument(
+        "-c",
+        "--caption",
+        required=False,
+        type=str,
+        choices=sorted(CAPTION_MODES),
+        default="link",
+        help="caption for forwarded media: none - no caption, link - link to original message (default), original - original message text",
     ),
     parser,
 )[-1]
@@ -464,6 +474,7 @@ async def main():
                 args.src_channel_id,
                 (args.dst_channel_id, channel.title),
                 (args.filter_type, args.filter_params),
+                caption=args.caption,
             )
             subscribe_to_channel(
                 event.sender_id, session.user_client, args.src_channel_id, bot_client

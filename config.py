@@ -87,6 +87,7 @@ def create_subscription(
     source_channel_id: int,
     sink: tuple[int, str],
     subscription_filter: tuple[str, str],
+    caption: str = "link",
 ):
     user_path = data_path.joinpath(str(user_id))
     if not user_path.exists() or not user_path.is_dir():
@@ -100,6 +101,7 @@ def create_subscription(
     sink_config = json.dumps(
         {
             "sink_name": sink[1],
+            "caption": caption,
             "filter": {
                 "type": subscription_filter[0],
                 "params": json.loads(subscription_filter[1]),

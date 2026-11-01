@@ -1,17 +1,24 @@
 import json
 import logging
 from functools import partial
-from typing import Any, cast
+from typing import Any, Optional, cast
 
 from telethon import TelegramClient, events
 from telethon.errors import RPCError
 from telethon.events import NewMessage
-from telethon.tl.types import DocumentAttributeAudio, Message, MessageMediaPhoto
+from telethon.tl.types import (
+    DocumentAttributeAudio,
+    Message,
+    MessageEntityHashtag,
+    MessageMediaPhoto,
+)
 
 import config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.DEBUG)
+
+CAPTION_MODES = {"none", "link", "original"}
 
 
 class Filter:
@@ -22,6 +29,8 @@ class Filter:
     def get_filter(**filter_data: str | dict[str, Any]) -> "Filter":
         if "mp3" == filter_data["type"].lower():
             return Mp3Filter(**filter_data["params"])
+        elif "hashtag" == filter_data["type"].lower():
+            return HashtagFilter(**filter_data["params"])
         else:
             raise ValueError(f"Unknown filter type {filter_data["type"]}")
 
@@ -62,12 +71,56 @@ class Mp3Filter(Filter):
         return f"Mp3Filter[min_length_seconds={self.min_length_seconds}, max_length_seconds={self.max_length_seconds}]"
 
 
+class HashtagFilter(Filter):
+
+    def __init__(self, **params):
+        tags = params["tags"]
+        if isinstance(tags, str):
+            tags = [tags]
+        self.tags = {self._normalize(tag) for tag in tags}
+
+    @staticmethod
+    def _normalize(tag: str) -> str:
+        return tag.lstrip("#").lower()
+
+    def filter_message(self, message) -> bool:
+        if not message or not isinstance(message, Message):
+            return False
+        message_tags = {
+            self._normalize(text)
+            for _, text in message.get_entities_text(MessageEntityHashtag)
+        }
+        return bool(self.tags & message_tags)
+
+    def __repr__(self):
+        return (
+            f"HashtagFilter[tags={", ".join(f"#{tag}" for tag in sorted(self.tags))}]"
+        )
+
+
+def build_caption(caption_mode: str, message: Message) -> Optional[str]:
+    match caption_mode:
+        case "none":
+            return None
+        case "link":
+            return f"https://t.me/c/{message.peer_id.channel_id}/{message.id}"
+        case "original":
+            return message.message
+        case _:
+            raise ValueError(f"Unknown caption mode {caption_mode}")
+
+
 class Sink(Filter):
 
     def __init__(self, sink_id: str, sink_config: str):
         self.id = int(sink_id)
         sink_cfg = json.loads(sink_config)
         self.name = sink_cfg["sink_name"]
+        self.caption = sink_cfg.get("caption", "link")
+        if self.caption not in CAPTION_MODES:
+            raise ValueError(
+                f"Unknown caption mode {self.caption} for sink {self.id}, must be one of {sorted(CAPTION_MODES)}"
+            )
         self.filter = Filter.get_filter(**sink_cfg["filter"])
 
     def filter_message(self, message) -> bool:
@@ -103,7 +156,7 @@ async def forward_to_sinks(
             result = await user_client.send_file(
                 sink.id,
                 message.media,
-                caption=f"https://t.me/c/{message.peer_id.channel_id}/{message.id}",
+                caption=build_caption(sink.caption, message),
             )
             logging.debug(f"Forwarded {message} to {sink} with result {result}")
         except RPCError as e:
