@@ -1,22 +1,16 @@
 import datetime
 import json
 import logging
-from typing import Optional
+from typing import Literal, Optional
 
-from telethon import TelegramClient, Button, functions, utils
+from telethon import Button, TelegramClient, functions, utils
 from telethon.tl.custom import Dialog
 from telethon.tl.types import DocumentAttributeFilename
-from typing_extensions import Literal
 
 import config
 from subscription import Sink
 
-logging.basicConfig(
-    level=logging.WARN,
-    format="%(asctime)s.%(msecs)03d %(levelname)s %(funcName)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__file__)
+logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 
@@ -68,7 +62,7 @@ async def get_all_channels_page(
         )
         previous_offset = offset_stack[-2] if len(offset_stack) >= 2 else None
     else:
-        raise f"Unknown action type {action_type}"
+        raise ValueError(f"Unknown action type {action_type}")
     logger.debug(
         f"returning for all channels request {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
     )
@@ -134,7 +128,7 @@ async def build_subscribed_channel_response(
         )
         previous_offset = offset_stack[-2] if len(offset_stack) >= 2 else None
     else:
-        raise f"Unknown action type {action_type}"
+        raise ValueError(f"Unknown action type {action_type}")
     logger.debug(
         f"returning for subscribed channel request {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
     )

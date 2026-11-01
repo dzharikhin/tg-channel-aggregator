@@ -4,27 +4,27 @@ import json
 import logging
 import re
 import shlex
-from argparse import ArgumentParser, ArgumentTypeError, Namespace, ArgumentError
-from asyncio import Future, Task
+from argparse import ArgumentError, ArgumentParser, ArgumentTypeError, Namespace
+from asyncio import Task
 from functools import partial
 from types import CoroutineType
 from typing import Optional, cast
 
 import persistqueue
 from telethon import TelegramClient, events
-from telethon.errors import RPCError, BadRequestError
+from telethon.errors import BadRequestError, RPCError
 from telethon.events import CallbackQuery, NewMessage
 from telethon.tl.functions.channels import GetChannelsRequest
 from telethon.tl.types import Chat
 from telethon.tl.types.messages import Chats
 
 import config
-from auth import UserClientState, NotAuthorizedClient, init_user_client
+from auth import AuthManager
 from channels import build_all_channel_response, build_subscribed_channel_response
 from subscription import (
+    forward_to_sinks,
     subscribe_to_channel,
     unsubscribe_from_channel,
-    forward_to_sinks,
 )
 
 # commands to implement:
@@ -43,17 +43,16 @@ logger.setLevel(logging.DEBUG)
 
 
 async def check_clients_consistency(
-    user_clients: dict[int, UserClientState],
+    auth_manager: AuthManager,
     tasks: dict[str, Task],
     bot_client: TelegramClient,
 ):
     while True:
-        user_id = None
         try:
-            await ensure_clients_consistency(user_clients, tasks, bot_client)
+            await ensure_clients_consistency(auth_manager, tasks, bot_client)
         except RPCError as e:
             logger.warning(
-                f"Exception on consistency check for {user_id}, continue",
+                "Exception on consistency check, continue",
                 exc_info=e,
             )
             await bot_client.send_message(
@@ -118,22 +117,23 @@ async def handle_queue_tasks(
 
 
 async def ensure_clients_consistency(
-    user_clients: dict[int, UserClientState],
-    tasks: dict[str, Future],
+    auth_manager: AuthManager,
+    tasks: dict[str, Task],
     bot_client: TelegramClient,
     reinit_handlers: bool = False,
 ):
-    for user_id, state in user_clients.items():
-        state = await state.get_or_create_client(user_clients, bot_client, user_id)
-        if not state:
+    for user_id in auth_manager.tracked_users():
+        session = await auth_manager.ensure_authorized(user_id)
+        if not session:
             continue
 
+        user_client = session.user_client
         if reinit_handlers:
-            for handler, event in state.user_client.list_event_handlers():
-                state.user_client.remove_event_handler(handler, event)
+            for handler, event in user_client.list_event_handlers():
+                user_client.remove_event_handler(handler, event)
         subscriptions = config.get_all_user_subscriptions(user_id)
         channels_to_listen = {ch for ch, _ in subscriptions}
-        current_handlers = state.user_client.list_event_handlers()
+        current_handlers = user_client.list_event_handlers()
         actual_subscribed_channels = {
             list(e.chats)[0]
             for _, e in current_handlers
@@ -142,31 +142,16 @@ async def ensure_clients_consistency(
         if len(actual_subscribed_channels) != len(current_handlers):
             logger.warning(f"For user {user_id} there are duplicate handlers")
         for to_add in channels_to_listen - actual_subscribed_channels:
-            subscribe_to_channel(user_id, state.user_client, to_add, bot_client)
+            subscribe_to_channel(user_id, user_client, to_add, bot_client)
         for to_remove in actual_subscribed_channels - channels_to_listen:
-            unsubscribe_from_channel(state.user_client, to_remove, bot_client)
+            unsubscribe_from_channel(user_client, to_remove, bot_client)
 
-        if state.queue is not None:
-            handle_task_id = f"queue_handler-{user_id}"
-            current_task = tasks.get(handle_task_id)
-            if not current_task or current_task.done() or current_task.cancelled():
-                tasks[handle_task_id] = asyncio.create_task(
-                    handle_queue_tasks(
-                        user_id, state.queue, state.user_client, bot_client
-                    ),
-                )
-
-
-async def launch_current_users(
-    bot_client: TelegramClient,
-) -> dict[int, UserClientState]:
-    return {
-        user_id: NotAuthorizedClient(
-            user_client=await init_user_client(user_id),
-            bot_client=bot_client,
-        )
-        for user_id in config.get_existing_users()
-    }
+        handle_task_id = f"queue_handler-{user_id}"
+        current_task = tasks.get(handle_task_id)
+        if not current_task or current_task.done() or current_task.cancelled():
+            tasks[handle_task_id] = asyncio.create_task(
+                handle_queue_tasks(user_id, session.queue, user_client, bot_client),
+            )
 
 
 def has_send_message_permission(chat: Chat):
@@ -210,7 +195,7 @@ LIST_CMD = (
     parser := ArgumentParser(
         prog="list",
         epilog="(?i)^/list(.*)$",
-        description="list channels\subscriptions",
+        description="list channels/subscriptions",
         exit_on_error=False,
         add_help=False,
     ),
@@ -288,7 +273,7 @@ SYNC_CMD = (
     parser := ArgumentParser(
         prog="sync",
         epilog="(?i)^/sync(.*)$",
-        description="sync messages in subscription\-s",
+        description="sync messages in subscriptions",
         exit_on_error=False,
         add_help=False,
     ),
@@ -304,68 +289,73 @@ SYNC_CMD = (
 )[-1]
 
 
+CMDS = [
+    START_CMD,  # always first element
+    LIST_CMD,
+    SUBSCRIBE_CMD,
+    UNSUBSCRIBE_CMD,
+    SYNC_CMD,
+]
+
+
 def _parse_args(
     arg_parser: ArgumentParser, cmd_line: str
 ) -> tuple[Namespace | None, str | None]:
     try:
         args = arg_parser.parse_args(shlex.split(cmd_line))
         return args, None
-    except ArgumentError as e:
+    except ArgumentError:
         buffer = io.StringIO()
         arg_parser.print_help(buffer)
         return None, buffer.getvalue()
 
 
-def not_matched_command(txt: str) -> bool:
-    return not any(
-        (
-            re.match(pattern, txt)
-            for pattern in (
-                START_CMD.epilog,
-                LIST_CMD.epilog,
-                SUBSCRIBE_CMD.epilog,
-                UNSUBSCRIBE_CMD.epilog,
-                SYNC_CMD.epilog,
-            )
-        )
-    )
+def _not_matched_command(txt: str) -> bool:
+    return not any((re.match(pattern, txt) for pattern in (cmd.epilog for cmd in CMDS)))
+
+
+def _filter_not_mapped(event: NewMessage.Event) -> bool:
+    return not event.is_channel and _not_matched_command(event.message.message or "")
+
+
+def build_help() -> str:
+    buffer = io.StringIO()
+    for cmd in CMDS[1:]:
+        buffer.write(f"/{cmd.prog} - {cmd.description}\n")
+        cmd.print_usage(buffer)
+        buffer.write("\n")
+    return buffer.getvalue()
 
 
 async def main():
     bot_client = await cast(
         CoroutineType,
         TelegramClient(
-            config.data_path.joinpath("bot"), config.api_id, config.api_hash
+            config.data_path.joinpath("bot"),
+            config.api_id,
+            config.api_hash,
+            connection_retries=None,
+            retry_delay=10,
+            catch_up=True,
         ).start(bot_token=config.bot_token),
     )
     tasks = {}
     async with bot_client:
         logger.debug(f"Started bot {await bot_client.get_me()}")
-        user_client_registry = await launch_current_users(bot_client)
+        auth_manager = AuthManager(bot_client)
+        await auth_manager.bootstrap()
 
-        @bot_client.on(events.NewMessage(incoming=True, pattern=not_matched_command))
+        @bot_client.on(events.NewMessage(incoming=True, func=_filter_not_mapped))
         @bot_client.on(events.NewMessage(incoming=True, pattern=START_CMD.epilog))
-        async def list_channels_handler(event: NewMessage.Event):
-            if not (
-                await UserClientState.get_or_create_client(
-                    user_client_registry, bot_client, event.sender_id, event
-                )
-            ):
+        async def start_handler(event: NewMessage.Event):
+            if not (await auth_manager.ensure_authorized(event.sender_id)):
                 return
             logger.debug(f"Received unknown command: <{event.message.message}>")
-            buffer = io.StringIO()
-            for cmd in [LIST_CMD, SUBSCRIBE_CMD, UNSUBSCRIBE_CMD, SYNC_CMD]:
-                buffer.write(f"/{cmd.prog}\n")
-                cmd.print_usage(buffer)
-            await event.respond(buffer.getvalue())
+            await event.respond(build_help())
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=LIST_CMD.epilog))
-        async def list_channels_handler(event: NewMessage.Event):
-            if not (
-                state := await UserClientState.get_or_create_client(
-                    user_client_registry, bot_client, event.sender_id, event
-                )
-            ):
+        async def list_handler(event: NewMessage.Event):
+            if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
 
             args, help_to_print = _parse_args(
@@ -378,13 +368,13 @@ async def main():
             if args.subs:
                 message_text, buttons, (pagination_data, attributes) = (
                     await build_subscribed_channel_response(
-                        event.sender_id, state.user_client, []
+                        event.sender_id, session.user_client, []
                     )
                 )
             else:
                 message_text, buttons, (pagination_data, attributes) = (
                     await build_all_channel_response(
-                        event.sender_id, state.user_client, []
+                        event.sender_id, session.user_client, []
                     )
                 )
             conditional_params = (
@@ -402,11 +392,7 @@ async def main():
             )
         )
         async def channels_pagination_handler(event: CallbackQuery.Event):
-            if not (
-                state := await UserClientState.get_or_create_client(
-                    user_client_registry, bot_client, event.sender_id, event
-                )
-            ):
+            if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
 
             message = (
@@ -423,7 +409,7 @@ async def main():
                 message_text, buttons, (pagination_data, attributes) = (
                     await build_all_channel_response(
                         event.sender_id,
-                        state.user_client,
+                        session.user_client,
                         offset_stack,
                         (target_offset, action_type),
                     )
@@ -435,13 +421,13 @@ async def main():
                 message_text, buttons, (pagination_data, attributes) = (
                     await build_subscribed_channel_response(
                         event.sender_id,
-                        state.user_client,
+                        session.user_client,
                         offset_stack,
                         (target_offset, action_type),
                     )
                 )
             else:
-                raise f"Unknown request type {request_type}"
+                raise ValueError(f"Unknown request type {request_type}")
             await event.edit(
                 message_text,
                 file=pagination_data,
@@ -451,11 +437,7 @@ async def main():
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=SUBSCRIBE_CMD.epilog))
         async def subscribe_handler(event: NewMessage.Event):
-            if not (
-                state := await UserClientState.get_or_create_client(
-                    user_client_registry, bot_client, event.sender_id, event
-                )
-            ):
+            if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
 
             args, help_to_print = _parse_args(
@@ -469,7 +451,7 @@ async def main():
                 f"subscribing user {event.sender_id}: {args.src_channel_id} -> {args.dst_channel_id} with filter {args.filter_type}({args.filter_params})"
             )
             channel = unwrap_single_chat(
-                await state.user_client(GetChannelsRequest(id=[args.dst_channel_id]))
+                await session.user_client(GetChannelsRequest(id=[args.dst_channel_id]))
             )
             if not has_send_message_permission(channel):
                 await event.respond(
@@ -484,7 +466,7 @@ async def main():
                 (args.filter_type, args.filter_params),
             )
             subscribe_to_channel(
-                event.sender_id, state.user_client, args.src_channel_id, bot_client
+                event.sender_id, session.user_client, args.src_channel_id, bot_client
             )
             await event.respond(
                 f"subscribed {args.src_channel_id} -> {args.dst_channel_id}"
@@ -492,11 +474,7 @@ async def main():
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD.epilog))
         async def unsubscribe_handler(event: NewMessage.Event):
-            if not (
-                state := await UserClientState.get_or_create_client(
-                    user_client_registry, bot_client, event.sender_id, event
-                )
-            ):
+            if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
 
             args, help_to_print = _parse_args(
@@ -513,7 +491,7 @@ async def main():
                 event.sender_id, args.src_channel_id, args.dst_channel_id
             ):
                 unsubscribe_from_channel(
-                    state.user_client, args.src_channel_id, bot_client
+                    session.user_client, args.src_channel_id, bot_client
                 )
             await event.respond(
                 f"unsubscribed {args.src_channel_id} -> {args.dst_channel_id}"
@@ -521,11 +499,7 @@ async def main():
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=SYNC_CMD.epilog))
         async def sync_handler(event: NewMessage.Event):
-            if not (
-                state := await UserClientState.get_or_create_client(
-                    user_client_registry, bot_client, event.sender_id, event
-                )
-            ):
+            if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
 
             args, help_to_print = _parse_args(
@@ -543,25 +517,22 @@ async def main():
                         mapping[channel_id] = default_offset
 
             for channel_id, offset in mapping.items():
-                state.queue.put(
+                session.queue.put(
                     {"cmd": "sync", "channel_id": channel_id, "from": offset}
                 )
 
         @bot_client.on(events.NewMessage(incoming=True, pattern="^[^/].+"))
         async def common_message_handler(event: NewMessage.Event):
-            await UserClientState.get_or_create_client(
-                user_client_registry, bot_client, event.sender_id, event
-            )
+            await auth_manager.feed_message(event.sender_id, event)
 
-        await ensure_clients_consistency(
-            user_client_registry, tasks, bot_client, reinit_handlers=True
-        )
+        await ensure_clients_consistency(auth_manager, tasks, bot_client, True)
         tasks["check_clients_consistency"] = asyncio.create_task(
-            check_clients_consistency(user_client_registry, tasks, bot_client)
+            check_clients_consistency(auth_manager, tasks, bot_client)
         )
         await bot_client.run_until_disconnected()
     for task in tasks.values():
         task.cancel("shutdown")
+    await auth_manager.disconnect_clients()
 
 
 # api_id = os.getenv("API_ID")

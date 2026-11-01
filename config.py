@@ -134,3 +134,7 @@ def get_allowed_to_use_user_ids() -> list[int]:
     if not whitelist_path.exists():
         return []
     return [int(user.name) for user in whitelist_path.iterdir()]
+
+
+def is_allowed_user(user_id: int) -> bool:
+    return user_id == owner_user_id or user_id in get_allowed_to_use_user_ids()
