@@ -161,6 +161,31 @@ def test_sink_caption_defaults_to_link_when_absent():
     assert sink.caption == "link"
 
 
+def test_sink_schedule_fields_default_when_absent():
+    sink = Sink(
+        "123",
+        '{"sink_name": "mine", "filter": {"type": "mp3", "params":'
+        ' {"min_seconds": 10, "max_seconds": 600}}}',
+    )
+    assert sink.schedule is None
+    assert sink.start_message_id is None
+    assert sink.batch == 1
+    assert sink.state == {}
+
+
+def test_sink_reads_schedule_fields_from_config():
+    sink = Sink(
+        "123",
+        '{"sink_name": "mine", "schedule": "0 9 * * *", "start_message_id": 42,'
+        ' "batch": 3, "state": {"last_forwarded_message_id": 43}, "filter":'
+        ' {"type": "mp3", "params": {"min_seconds": 10, "max_seconds": 600}}}',
+    )
+    assert sink.schedule == "0 9 * * *"
+    assert sink.start_message_id == 42
+    assert sink.batch == 3
+    assert sink.state == {"last_forwarded_message_id": 43}
+
+
 def test_sink_reads_caption_from_config():
     sink = Sink(
         "123",

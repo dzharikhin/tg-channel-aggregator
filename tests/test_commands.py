@@ -23,6 +23,7 @@ def test_not_matched_command_matches_every_registered_cmd():
         "/list": True,
         "/list --subs": True,
         "/subscribe -s 1 -d 2 -f mp3 -p {}": True,
+        '/subscribe -s 1 -d 2 -f mp3 -p {} -r "0 9 * * *" -b 2': True,
         "/unsubscribe -s 1 -d 2": True,
         "/sync --pairs 1=full": True,
         "/nope": False,
@@ -73,6 +74,40 @@ def test_jsonarg():
     assert client.jsonarg('{"a": 1}') == '{"a": 1}'
     with pytest.raises(ArgumentTypeError):
         client.jsonarg("not json")
+
+
+def test_cronarg():
+    assert client.cronarg("0 9 * * *") == "0 9 * * *"
+    assert client.cronarg("*/15 * * * *") == "*/15 * * * *"
+    with pytest.raises(ArgumentTypeError):
+        client.cronarg("not a cron")
+
+
+def test_parse_args_schedule_options():
+    args, err = client._parse_args(
+        client.SUBSCRIBE_CMD, '-s 1 -d 2 -f mp3 -p {} -r "0 9 * * *" -m 100 -b 3'
+    )
+    assert err is None
+    assert (args.src_channel_id, args.dst_channel_id) == (1, 2)
+    assert args.schedule == "0 9 * * *"
+    assert args.start_message_id == 100
+    assert args.batch == 3
+
+
+def test_parse_args_schedule_defaults():
+    args, err = client._parse_args(client.SUBSCRIBE_CMD, "-s 1 -d 2 -f mp3 -p {}")
+    assert err is None
+    assert args.schedule is None
+    assert args.start_message_id is None
+    assert args.batch == 1
+
+
+def test_parse_args_rejects_invalid_cron():
+    args, err = client._parse_args(
+        client.SUBSCRIBE_CMD, "-s 1 -d 2 -f mp3 -p {} -r nonsense"
+    )
+    assert args is None
+    assert "usage:" in err
 
 
 def test_build_help_covers_all_cmds_except_start():

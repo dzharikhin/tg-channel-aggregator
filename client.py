@@ -8,19 +8,21 @@ from argparse import ArgumentError, ArgumentParser, ArgumentTypeError, Namespace
 from asyncio import Task
 from functools import partial
 from types import CoroutineType
-from typing import Optional, cast
+from typing import cast
 
 import persistqueue
+from croniter import croniter
 from telethon import TelegramClient, events
 from telethon.errors import BadRequestError, RPCError
 from telethon.events import CallbackQuery, NewMessage
 from telethon.tl.functions.channels import GetChannelsRequest
 from telethon.tl.types import Chat
-from telethon.tl.types.messages import Chats
 
 import config
 from auth import AuthManager
 from channels import build_all_channel_response, build_subscribed_channel_response
+from common import unwrap_single_chat
+from scheduler import run_scheduled_forwardings
 from subscription import (
     CAPTION_MODES,
     forward_to_sinks,
@@ -30,7 +32,7 @@ from subscription import (
 
 # commands to implement:
 # - list-channels [subs] - shows user channels and ids, subs - show only subscribed channels
-# - subscribe <channel_id_from> <channel_id_to> {<filter json>} - add/update subscription
+# - subscribe <channel_id_from> <channel_id_to> {<filter json>} [<caption>] [<cron schedule> <start_msg_id> <batch>] - add/update subscription
 # - unsubscribe <channel_id_from> <channel_id_to>
 # - sync {"<channel_id>"/"all"="full"/<msg_id>[, "<channel_id>"="full"/<msg_id>]} - sync channels from offset
 
@@ -159,18 +161,18 @@ def has_send_message_permission(chat: Chat):
     return chat.admin_rights.post_messages if chat else False
 
 
-def unwrap_single_chat(chat: Chats) -> Optional[Chat]:
-    if not chat or not chat.chats:
-        return None
-    return chat.chats[0]
-
-
 def jsonarg(arg: str) -> str:
     try:
         json.loads(arg)
         return arg
     except json.JSONDecodeError:
         raise ArgumentTypeError(f"{arg} is not a valid json")
+
+
+def cronarg(arg: str) -> str:
+    if not croniter.is_valid(arg):
+        raise ArgumentTypeError(f"{arg} is not a valid cron expression")
+    return arg
 
 
 def syncpairarg(err_msg: str, arg: str) -> tuple[int | str, int | str]:
@@ -252,6 +254,30 @@ SUBSCRIBE_CMD = (
         choices=sorted(CAPTION_MODES),
         default="link",
         help="caption for forwarded media: none - no caption, link - link to original message (default), original - original message text",
+    ),
+    parser.add_argument(
+        "-r",
+        "--schedule",
+        required=False,
+        type=cronarg,
+        default=None,
+        help="cron expression to forward on schedule (e.g. '0 9 * * *'). if omitted, messages are forwarded in realtime",
+    ),
+    parser.add_argument(
+        "-m",
+        "--start_message_id",
+        required=False,
+        type=int,
+        default=None,
+        help="id of the last handled source message: scheduled forwarding starts from the next one. without it the first run skips the whole history. used only with --schedule",
+    ),
+    parser.add_argument(
+        "-b",
+        "--batch",
+        required=False,
+        type=int,
+        default=1,
+        help="max messages to forward per scheduled run",
     ),
     parser,
 )[-1]
@@ -475,12 +501,16 @@ async def main():
                 (args.dst_channel_id, channel.title),
                 (args.filter_type, args.filter_params),
                 caption=args.caption,
+                schedule=args.schedule,
+                start_message_id=args.start_message_id,
+                batch=args.batch,
             )
             subscribe_to_channel(
                 event.sender_id, session.user_client, args.src_channel_id, bot_client
             )
             await event.respond(
                 f"subscribed {args.src_channel_id} -> {args.dst_channel_id}"
+                + (f" on schedule {args.schedule!r}" if args.schedule else "")
             )
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD.epilog))
@@ -539,6 +569,9 @@ async def main():
         await ensure_clients_consistency(auth_manager, tasks, bot_client, True)
         tasks["check_clients_consistency"] = asyncio.create_task(
             check_clients_consistency(auth_manager, tasks, bot_client)
+        )
+        tasks["scheduled_forwarding"] = asyncio.create_task(
+            run_scheduled_forwardings(auth_manager, bot_client)
         )
         await bot_client.run_until_disconnected()
     for task in tasks.values():

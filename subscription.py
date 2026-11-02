@@ -122,6 +122,10 @@ class Sink(Filter):
                 f"Unknown caption mode {self.caption} for sink {self.id}, must be one of {sorted(CAPTION_MODES)}"
             )
         self.filter = Filter.get_filter(**sink_cfg["filter"])
+        self.schedule = sink_cfg.get("schedule")
+        self.start_message_id = sink_cfg.get("start_message_id")
+        self.batch = sink_cfg.get("batch", 1)
+        self.state = sink_cfg.get("state", {})
 
     def filter_message(self, message) -> bool:
         return self.filter.filter_message(message)
@@ -147,6 +151,11 @@ async def forward_to_sinks(
     bot_client: TelegramClient,
 ):
     for sink in sinks_for_channel:
+        if sink.schedule:
+            logger.debug(
+                f"For user {user_id} sink {sink} is scheduled ({sink.schedule}), skipping realtime/sync forwarding"
+            )
+            continue
         if not sink.filter_message(message):
             logger.debug(
                 f"For user {user_id} got message {message.stringify()}, did not match for sink {sink}, skipping"

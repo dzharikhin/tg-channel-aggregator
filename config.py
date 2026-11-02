@@ -2,6 +2,7 @@ import json
 import os
 import pathlib
 import re
+from datetime import datetime
 
 from subscription import Sink
 
@@ -26,6 +27,7 @@ not_overridable_properties = {
 
 user_client_check_period_seconds = 10
 dialog_list_page_size = 10
+scheduler_tick_seconds = 30
 
 
 def override():
@@ -88,6 +90,9 @@ def create_subscription(
     sink: tuple[int, str],
     subscription_filter: tuple[str, str],
     caption: str = "link",
+    schedule: str | None = None,
+    start_message_id: int | None = None,
+    batch: int = 1,
 ):
     user_path = data_path.joinpath(str(user_id))
     if not user_path.exists() or not user_path.is_dir():
@@ -98,17 +103,50 @@ def create_subscription(
     source_config_path = user_subscriptions_dir.joinpath(str(source_channel_id))
     source_config_path.mkdir(exist_ok=True)
     sink_config_path = source_config_path.joinpath(f"{sink[0]}.json")
-    sink_config = json.dumps(
-        {
-            "sink_name": sink[1],
-            "caption": caption,
-            "filter": {
-                "type": subscription_filter[0],
-                "params": json.loads(subscription_filter[1]),
-            },
-        }
+    existing_sink_config = {}
+    if sink_config_path.exists():
+        existing_sink_config = json.loads(sink_config_path.read_text())
+    sink_config = {
+        "sink_name": sink[1],
+        "caption": caption,
+        "filter": {
+            "type": subscription_filter[0],
+            "params": json.loads(subscription_filter[1]),
+        },
+    }
+    if schedule:
+        sink_config["schedule"] = schedule
+    if start_message_id is not None:
+        sink_config["start_message_id"] = start_message_id
+    if batch != 1:
+        sink_config["batch"] = batch
+    # runtime state survives re-subscription unless schedule-defining options
+    # changed: those start a fresh forwarding pointer
+    if existing_sink_config.get("state") and (
+        existing_sink_config.get("schedule") == sink_config.get("schedule")
+        and existing_sink_config.get("start_message_id")
+        == sink_config.get("start_message_id")
+    ):
+        sink_config["state"] = existing_sink_config["state"]
+    elif schedule:
+        # scheduler anchor: the next due time is the first cron occurrence
+        # after this moment
+        sink_config["state"] = {"last_run_at": datetime.now().isoformat()}
+    sink_config_path.write_text(json.dumps(sink_config))
+
+
+def update_sink_state(
+    user_id: int, source_channel_id: int, sink_channel_id: int, state: dict
+):
+    sink_config_path = (
+        data_path.joinpath(str(user_id))
+        .joinpath("subscriptions")
+        .joinpath(str(source_channel_id))
+        .joinpath(f"{sink_channel_id}.json")
     )
-    sink_config_path.write_text(sink_config)
+    sink_config = json.loads(sink_config_path.read_text())
+    sink_config["state"] = state
+    sink_config_path.write_text(json.dumps(sink_config))
 
 
 def remove_subscription(user_id: int, source_channel_id, sink_channel_id) -> bool:
