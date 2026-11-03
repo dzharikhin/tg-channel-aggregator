@@ -6,6 +6,7 @@ import re
 import shlex
 from argparse import ArgumentError, ArgumentParser, ArgumentTypeError, Namespace
 from asyncio import Task
+from collections import Counter
 from functools import partial
 from types import CoroutineType
 from typing import cast
@@ -26,6 +27,7 @@ from scheduler import run_scheduled_forwardings
 from subscription import (
     CAPTION_MODES,
     forward_to_sinks,
+    handler_channel_ids,
     subscribe_to_channel,
     unsubscribe_from_channel,
 )
@@ -136,18 +138,24 @@ async def ensure_clients_consistency(
                 user_client.remove_event_handler(handler, event)
         subscriptions = config.get_all_user_subscriptions(user_id)
         channels_to_listen = {ch for ch, _ in subscriptions}
-        current_handlers = user_client.list_event_handlers()
-        actual_subscribed_channels = {
-            list(e.chats)[0]
-            for _, e in current_handlers
-            if isinstance(e, events.NewMessage)
-        }
-        if len(actual_subscribed_channels) != len(current_handlers):
-            logger.warning(f"For user {user_id} there are duplicate handlers")
+        channel_handler_counts = Counter(
+            channel_id
+            for _, event in user_client.list_event_handlers()
+            for channel_id in handler_channel_ids(event)
+        )
+        for channel_id, count in channel_handler_counts.items():
+            if count > 1:
+                logger.warning(
+                    f"For user {user_id} there are duplicate handlers for channel {channel_id}, deduplicating"
+                )
+                unsubscribe_from_channel(user_client, channel_id)
+                if channel_id in channels_to_listen:
+                    subscribe_to_channel(user_id, user_client, channel_id, bot_client)
+        actual_subscribed_channels = set(channel_handler_counts)
         for to_add in channels_to_listen - actual_subscribed_channels:
             subscribe_to_channel(user_id, user_client, to_add, bot_client)
         for to_remove in actual_subscribed_channels - channels_to_listen:
-            unsubscribe_from_channel(user_client, to_remove, bot_client)
+            unsubscribe_from_channel(user_client, to_remove)
 
         handle_task_id = f"queue_handler-{user_id}"
         current_task = tasks.get(handle_task_id)
@@ -531,9 +539,7 @@ async def main():
             if config.remove_subscription(
                 event.sender_id, args.src_channel_id, args.dst_channel_id
             ):
-                unsubscribe_from_channel(
-                    session.user_client, args.src_channel_id, bot_client
-                )
+                unsubscribe_from_channel(session.user_client, args.src_channel_id)
             await event.respond(
                 f"unsubscribed {args.src_channel_id} -> {args.dst_channel_id}"
             )

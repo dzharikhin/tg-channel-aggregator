@@ -179,22 +179,44 @@ async def forward_to_sinks(
             )
 
 
+def handler_channel_ids(event) -> set[int]:
+    """Positive channel ids of a NewMessage builder, valid pre- and post-resolution.
+
+    Telethon rewrites builder ``chats`` from the originally passed ``[id]`` to
+    ``{id, -id, -100id}`` (all peer types) when the builder gets resolved, so
+    keep the positive ids only - those are what subscription config stores.
+    """
+    if not isinstance(event, events.NewMessage) or event.chats is None:
+        return set()
+    return {chat for chat in event.chats if isinstance(chat, int) and chat > 0}
+
+
 def subscribe_to_channel(
     user_id: int,
     user_client: TelegramClient,
     source_channel_id: int,
     bot_client: TelegramClient,
 ):
+    channel_id = int(source_channel_id)
+    already_subscribed = any(
+        channel_id in handler_channel_ids(event)
+        for _, event in user_client.list_event_handlers()
+    )
+    if already_subscribed:
+        logger.debug(f"Handler for channel {channel_id} already exists, skipping")
+        return
     user_client.add_event_handler(
         partial(new_message_in_target_channel_handler, user_id, bot_client),
-        event=events.NewMessage(chats=[int(source_channel_id)]),
+        event=events.NewMessage(chats=[channel_id]),
     )
 
 
-def unsubscribe_from_channel(
-    user_client: TelegramClient, source_channel_id: int, bot_client: TelegramClient
-):
-    user_client.remove_event_handler(
-        partial(new_message_in_target_channel_handler, bot_client),
-        event=events.NewMessage(chats=[int(source_channel_id)]),
-    )
+def unsubscribe_from_channel(user_client: TelegramClient, source_channel_id: int):
+    channel_id = int(source_channel_id)
+    removed = 0
+    for handler, event in user_client.list_event_handlers():
+        if channel_id in handler_channel_ids(event):
+            user_client.remove_event_handler(handler)
+            removed += 1
+    if removed:
+        logger.debug(f"Removed {removed} handlers for channel {channel_id}")
