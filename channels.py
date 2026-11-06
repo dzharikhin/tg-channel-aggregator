@@ -4,10 +4,12 @@ import logging
 from typing import Literal, Optional
 
 from telethon import Button, TelegramClient, functions, utils
+from telethon.errors import RPCError
 from telethon.tl.custom import Dialog
 from telethon.tl.types import DocumentAttributeFilename
 
 import config
+from common import unwrap_single_chat
 from subscription import Sink
 
 logger = logging.getLogger(__name__)
@@ -99,9 +101,35 @@ async def build_subscribed_channel_response(
     subscription_slice = subscriptions[
         target_offset : target_offset + config.dialog_list_page_size
     ]
-    subscriptions_page = await user_client(
-        functions.channels.GetChannelsRequest(id=[s for s, _ in subscription_slice])
-    )
+    try:
+        chats_page = (
+            await user_client(
+                functions.channels.GetChannelsRequest(
+                    id=[s for s, _ in subscription_slice]
+                )
+            )
+        ).chats
+        unavailable = []
+    except (RPCError, ValueError) as e:
+        logger.warning(
+            f"Cannot resolve subscribed channels {[s for s, _ in subscription_slice]} at once, "
+            f"falling back to per-channel resolution",
+            exc_info=e,
+        )
+        chats_page = []
+        unavailable = []
+        for channel_id, _ in subscription_slice:
+            try:
+                chats_page.append(
+                    unwrap_single_chat(
+                        await user_client(
+                            functions.channels.GetChannelsRequest(id=[channel_id])
+                        )
+                    )
+                )
+            except (RPCError, ValueError):
+                unavailable.append(channel_id)
+        chats_page = [chat for chat in chats_page if chat]
 
     if not action_type:
         previous_offset = None
@@ -133,14 +161,21 @@ async def build_subscribed_channel_response(
         f"returning for subscribed channel request {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
     )
 
-    return await format_channel_response(
-        "subs",
-        subscriptions_page.chats,
-        offset_stack,
-        previous_offset,
-        next_offset,
-        dict(subscriptions),
+    message_text, buttons, (pagination_data, attributes) = (
+        await format_channel_response(
+            "subs",
+            chats_page,
+            offset_stack,
+            previous_offset,
+            next_offset,
+            dict(subscriptions),
+        )
     )
+    if unavailable:
+        message_text += (
+            f"\nUnavailable: {", ".join(str(channel_id) for channel_id in unavailable)}"
+        )
+    return message_text, buttons, (pagination_data, attributes)
 
 
 async def format_channel_response(

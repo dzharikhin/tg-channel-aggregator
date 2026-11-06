@@ -1,5 +1,6 @@
 import asyncio
 from argparse import ArgumentTypeError
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +18,9 @@ from fakes import (
     photo_message,
 )
 from telethon.errors import ChannelPrivateError, RPCError
+from telethon.tl.types import Channel, ChatPhotoEmpty
 
+import channels
 import client
 import config
 
@@ -204,6 +207,92 @@ async def test_subscribe_creates_subscription_when_bot_may_post(data_path):
     assert event.responses[0].startswith(f"subscribed {SRC} -> {DST}")
     sinks = config.get_channel_subscriptions(USER_ID, SRC)
     assert [sink.name for sink in sinks] == ["the sink"]
+
+
+async def test_subscribe_unreadable_source_reports_read_error(data_path):
+    event = FakeSubscribeEvent()
+    session = SimpleNamespace(
+        user_client=FakeHandlerClient(
+            call_error=ValueError("Could not find the input entity")
+        )
+    )
+    bot = FakeBot(chats=[fake_channel(post_messages=True)])
+
+    await client.process_subscribe(event, session, bot, subscribe_args())
+
+    assert "READ access" in event.responses[0]
+    assert "no permission" not in event.responses[0]
+    assert config.get_channel_subscriptions(USER_ID, SRC) == []
+
+
+async def test_subscribe_unresolvable_sink_reports_write_error(data_path):
+    event = FakeSubscribeEvent()
+    bot = FakeBot(call_error=ValueError("Could not find the input entity"))
+
+    await client.process_subscribe(
+        event, SimpleNamespace(user_client=FakeHandlerClient()), bot, subscribe_args()
+    )
+
+    assert "no permission to post" in event.responses[0]
+    assert "READ access" not in event.responses[0]
+    assert config.get_channel_subscriptions(USER_ID, SRC) == []
+
+
+async def test_subscribe_reports_read_and_write_errors_together(data_path):
+    event = FakeSubscribeEvent()
+    session = SimpleNamespace(
+        user_client=FakeHandlerClient(call_error=ChannelPrivateError(None))
+    )
+    bot = FakeBot(call_error=ValueError("Could not find the input entity"))
+
+    await client.process_subscribe(event, session, bot, subscribe_args())
+
+    assert "READ access" in event.responses[0]
+    assert "no permission to post" in event.responses[0]
+    assert config.get_channel_subscriptions(USER_ID, SRC) == []
+
+
+async def test_subscribed_channel_list_falls_back_to_per_channel_resolution(
+    data_path,
+):
+    config.create_subscription(USER_ID, SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
+    src_channel = Channel(
+        id=SRC,
+        title="the source",
+        access_hash=1,
+        photo=ChatPhotoEmpty(),
+        date=datetime(2026, 1, 1),
+    )
+    calls = []
+
+    class FlakyUserClient(FakeHandlerClient):
+        async def __call__(self, request):
+            calls.append(request)
+            if len(calls) == 1:
+                raise ValueError("Could not find the input entity")
+            return SimpleNamespace(chats=[src_channel])
+
+    message_text, _, _ = await channels.build_subscribed_channel_response(
+        USER_ID, FlakyUserClient(), []
+    )
+
+    assert len(calls) == 2
+    assert "the source" in message_text
+    assert "Unavailable" not in message_text
+
+
+async def test_subscribed_channel_list_reports_unavailable_channels(data_path):
+    config.create_subscription(USER_ID, SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
+
+    class NoResolveUserClient(FakeHandlerClient):
+        async def __call__(self, request):
+            raise ValueError("Could not find the input entity")
+
+    message_text, _, _ = await channels.build_subscribed_channel_response(
+        USER_ID, NoResolveUserClient(), []
+    )
+
+    assert f"Unavailable: {SRC}" in message_text
 
 
 def test_requeue_sync_with_progress():

@@ -204,8 +204,15 @@ class FakeQueue:
 class FakeHandlerClient:
     """Minimal user client with telethon's handler-registry no-op semantics."""
 
-    def __init__(self):
+    def __init__(self, chats=None, call_error=None):
         self._handlers = []
+        self.chats = chats if chats is not None else [SimpleNamespace(id=SRC)]
+        self.call_error = call_error
+
+    async def __call__(self, request):
+        if self.call_error is not None:
+            raise self.call_error
+        return SimpleNamespace(chats=self.chats)
 
     def add_event_handler(self, callback, event=None):
         self._handlers.append((callback, event))

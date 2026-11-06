@@ -200,20 +200,37 @@ async def process_subscribe(
     logger.debug(
         f"subscribing user {event.sender_id}: {args.src_channel_id} -> {args.dst_channel_id} with filter {args.filter_type}({args.filter_params})"
     )
+    errors = []
+    try:
+        await session.user_client(GetChannelsRequest(id=[args.src_channel_id]))
+    except (RPCError, ValueError) as e:
+        logger.warning(
+            f"User client cannot read source channel {args.src_channel_id}",
+            exc_info=e,
+        )
+        errors.append(
+            f"Your account has no READ access to source channel "
+            f"{args.src_channel_id}. Make sure your account is a member there; "
+            f"check the id via /list."
+        )
+
     channel = None
     try:
         channel = unwrap_single_chat(
             await bot_client(GetChannelsRequest(id=[args.dst_channel_id]))
         )
-    except RPCError as e:
+    except (RPCError, ValueError) as e:
         logger.warning(
             f"Bot cannot access sink channel {args.dst_channel_id}", exc_info=e
         )
     if not channel or not has_send_message_permission(channel):
-        await event.respond(
+        errors.append(
             f"Bot has no permission to post in {args.dst_channel_id}. "
             f"Add the bot as admin with post rights and retry."
         )
+
+    if errors:
+        await event.respond("\n".join(errors))
         return
 
     config.create_subscription(
