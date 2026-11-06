@@ -203,7 +203,7 @@ def is_duplicate(sink: Sink, source_message: Message, sink_message: Message) -> 
 
 
 async def _sink_recently_received(
-    bot_client: TelegramClient, sink: Sink, message: Message
+    user_client: TelegramClient, sink: Sink, message: Message
 ) -> bool:
     for attempt in (1, 2):
         try:
@@ -211,7 +211,7 @@ async def _sink_recently_received(
             offset_date = datetime.now() - timedelta(
                 minutes=config.dedup_window_minutes
             )
-            async for sink_message in bot_client.iter_messages(
+            async for sink_message in user_client.iter_messages(
                 sink.id, offset_date=offset_date
             ):
                 if is_duplicate(sink, message, sink_message):
@@ -226,13 +226,14 @@ async def _sink_recently_received(
 
 async def deliver_to_sink(
     user_id: int,
+    user_client: TelegramClient,
     bot_client: TelegramClient,
     sink: Sink,
     message: Message,
 ) -> DeliveryResult:
     """Single send pipeline for one message to one sink: dedup, pacing, bounded errors."""
     try:
-        duplicate = await _sink_recently_received(bot_client, sink, message)
+        duplicate = await _sink_recently_received(user_client, sink, message)
     except Exception as e:
         logger.warning(
             f"Could not read history of {sink.name}({sink.id}) to dedup message {message.id}",
@@ -307,14 +308,20 @@ def dm_text_for_failure(sink: Sink, key: str) -> str:
 
 
 async def new_message_in_target_channel_handler(
-    user_id: int, bot_client: TelegramClient, event: NewMessage.Event
+    user_id: int,
+    user_client: TelegramClient,
+    bot_client: TelegramClient,
+    event: NewMessage.Event,
 ):
     sinks_for_channel = config.get_channel_subscriptions(user_id, event.chat_id)
-    await forward_to_sinks(user_id, event.message, sinks_for_channel, bot_client)
+    await forward_to_sinks(
+        user_id, user_client, event.message, sinks_for_channel, bot_client
+    )
 
 
 async def forward_to_sinks(
     user_id,
+    user_client: TelegramClient,
     message: Message,
     sinks_for_channel,
     bot_client: TelegramClient,
@@ -331,7 +338,9 @@ async def forward_to_sinks(
                     f"For user {user_id} message {message.id} did not match for sink {sink}, skipping"
                 )
                 continue
-            result = await deliver_to_sink(user_id, bot_client, sink, message)
+            result = await deliver_to_sink(
+                user_id, user_client, bot_client, sink, message
+            )
             if result.outcome == Outcome.FAILED and result.key:
                 notifications.enqueue_error_dm(
                     user_id, result.key, dm_text_for_failure(sink, result.key)
@@ -380,7 +389,7 @@ async def forward_channel_history(
                 channel, reverse=True, min_id=min_id
             ):
                 last_processed_id = message.id
-                await forward_to_sinks(user_id, message, sinks, bot_client)
+                await forward_to_sinks(user_id, user_client, message, sinks, bot_client)
     except RPCError as e:
         raise ChannelHistoryError(last_processed_id, e) from e
     return last_processed_id
@@ -419,7 +428,9 @@ def subscribe_to_channel(
         logger.debug(f"Handler for channel {channel_id} already exists, skipping")
         return
     user_client.add_event_handler(
-        partial(new_message_in_target_channel_handler, user_id, bot_client),
+        partial(
+            new_message_in_target_channel_handler, user_id, user_client, bot_client
+        ),
         event=events.NewMessage(chats=[channel_id]),
     )
 

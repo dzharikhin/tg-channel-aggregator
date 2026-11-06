@@ -67,7 +67,7 @@ async def forward_step(
             # batch is full: leave the rest, starting from this message,
             # for the next scheduled run
             break
-        result = await deliver_to_sink(user_id, bot_client, sink, message)
+        result = await deliver_to_sink(user_id, user_client, bot_client, sink, message)
         # the pointer advances past EVERY examined message, failed ones
         # included: failed sends are not retried
         state["last_forwarded_message_id"] = message.id

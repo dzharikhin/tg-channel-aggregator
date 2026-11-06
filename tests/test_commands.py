@@ -110,7 +110,10 @@ def peer_user(id=DST):
 def session_with_readable_src():
     return SimpleNamespace(
         user_client=FakeHandlerClient(
-            entities={MARKED_SRC: peer_channel(id=SRC, title="the source")}
+            entities={
+                MARKED_SRC: peer_channel(id=SRC, title="the source"),
+                MARKED_DST: peer_channel(id=DST, title="the sink"),
+            }
         )
     )
 
@@ -370,6 +373,22 @@ async def test_subscribe_unreadable_source_reports_read_error(data_path):
 
     assert "READ access" in event.responses[0]
     assert "no permission" not in event.responses[0]
+    assert config.get_channel_subscriptions(USER_ID, MARKED_SRC) == []
+
+
+async def test_subscribe_unreadable_sink_reports_read_error(data_path):
+    event = FakeSubscribeEvent()
+    session = SimpleNamespace(
+        user_client=FakeHandlerClient(
+            entities={MARKED_SRC: peer_channel(id=SRC, title="the source")}
+        )
+    )
+    bot = FakeBot(entities={MARKED_DST: peer_channel(title="the sink")})
+
+    await client.process_subscribe(event, session, bot, subscribe_args())
+
+    assert "sink channel" in event.responses[0]
+    assert "READ access" in event.responses[0]
     assert config.get_channel_subscriptions(USER_ID, MARKED_SRC) == []
 
 

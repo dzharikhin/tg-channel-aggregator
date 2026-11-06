@@ -219,6 +219,19 @@ async def process_subscribe(
         )
 
     try:
+        await session.user_client.get_entity(args.dst_channel_id)
+    except (RPCError, ValueError) as e:
+        logger.warning(
+            f"User client cannot read sink channel {args.dst_channel_id} " f"for dedup",
+            exc_info=e,
+        )
+        errors.append(
+            f"Your account has no READ access to sink channel "
+            f"{args.dst_channel_id}. Duplicate checks read its history via "
+            f"your account; join the channel and retry."
+        )
+
+    try:
         sink_entity = await bot_client.get_entity(args.dst_channel_id)
     except (RPCError, ValueError) as e:
         logger.warning(

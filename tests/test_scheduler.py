@@ -80,9 +80,7 @@ async def test_first_run_without_start_skips_whole_history(data_path):
 
 async def test_start_message_id_defines_first_candidates(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=1)
-    user_client = FakeUserClient(
-        [mp3_message(1), mp3_message(2), mp3_message(3)]
-    )
+    user_client = FakeUserClient([mp3_message(1), mp3_message(2), mp3_message(3)])
     bot = FakeBot()
 
     await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
@@ -120,9 +118,7 @@ async def test_next_run_resumes_after_drip_feed_pointer(data_path):
 
 async def test_non_matching_tail_is_skipped_not_rescanned(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=0)
-    user_client = FakeUserClient(
-        [mp3_message(1), photo_message(2), photo_message(3)]
-    )
+    user_client = FakeUserClient([mp3_message(1), photo_message(2), photo_message(3)])
     bot = FakeBot()
 
     await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
@@ -175,9 +171,10 @@ async def test_dedup_skip_advances_pointer_without_dm(data_path):
             mp3_message(1, document_id=101, file_name="1.mp3", size=101),
             duplicated,
             mp3_message(3, document_id=103, file_name="3.mp3", size=103),
-        ]
+        ],
+        sink_history=[sink_message(7, media=duplicated.media)],
     )
-    bot = FakeBot(history=[sink_message(7, media=duplicated.media)])
+    bot = FakeBot()
 
     await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
 
@@ -223,7 +220,9 @@ async def test_forward_to_sinks_skips_scheduled_sinks():
     )
     bot = FakeBot()
 
-    await forward_to_sinks(USER_ID, mp3_message(5), [scheduled, realtime], bot)
+    await forward_to_sinks(
+        USER_ID, FakeUserClient(), mp3_message(5), [scheduled, realtime], bot
+    )
 
     assert [sink_id for sink_id, _, _ in bot.sent_files] == [DST + 1]
 

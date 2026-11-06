@@ -158,12 +158,22 @@ class FakeUserClient:
         fail_with=None,
         chats=None,
         get_entity_error=None,
+        sink_history=(),
+        iter_errors=None,
+        call_times=None,
     ):
         self.messages = sorted(messages, key=lambda m: m.id)
         self.fail_after = fail_after
         self.fail_with = fail_with
         self.chats = chats
         self.get_entity_error = get_entity_error
+        self.sink_history = list(sink_history)
+        self.iter_errors = list(iter_errors or [])
+        self.call_times = call_times
+
+    def _track_call(self):
+        if self.call_times is not None:
+            self.call_times.append(time.monotonic())
 
     async def __call__(self, request):
         chats = self.chats if self.chats is not None else [SimpleNamespace(id=SRC)]
@@ -178,6 +188,19 @@ class FakeUserClient:
         return self.messages[-limit:] if self.messages else []
 
     def iter_messages(self, entity, min_id=None, reverse=False, **kwargs):
+        if entity == DST:
+            self._track_call()
+            errors = list(self.iter_errors)
+            self.iter_errors = []
+
+            async def _sink_gen():
+                if errors:
+                    raise errors.pop(0)
+                for message in self.sink_history:
+                    yield message
+
+            return _sink_gen()
+
         msgs = [m for m in self.messages if m.id > (min_id or 0)]
         if not reverse:
             msgs = list(reversed(msgs))
