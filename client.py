@@ -481,6 +481,28 @@ def build_help() -> str:
     return buffer.getvalue()
 
 
+def report_errors(handler):
+    async def wrapper(event):
+        try:
+            return await handler(event)
+        except Exception as e:
+            logger.error(f"Unhandled exception in {handler.__name__}", exc_info=e)
+            for feedback in ("respond", "answer", "edit"):
+                feedback_call = getattr(event, feedback, None)
+                if not feedback_call:
+                    continue
+                try:
+                    await feedback_call(
+                        "Internal error while processing the command, it has been logged"
+                    )
+                except Exception:
+                    continue
+                break
+
+    wrapper.__name__ = handler.__name__
+    return wrapper
+
+
 async def main():
     bot_client = await cast(
         CoroutineType,
@@ -501,6 +523,7 @@ async def main():
 
         @bot_client.on(events.NewMessage(incoming=True, func=_filter_not_mapped))
         @bot_client.on(events.NewMessage(incoming=True, pattern=START_CMD.epilog))
+        @report_errors
         async def start_handler(event: NewMessage.Event):
             if not (await auth_manager.ensure_authorized(event.sender_id)):
                 return
@@ -508,6 +531,7 @@ async def main():
             await event.respond(build_help())
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=LIST_CMD.epilog))
+        @report_errors
         async def list_handler(event: NewMessage.Event):
             if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
@@ -545,6 +569,7 @@ async def main():
                 data=re.compile("^ch-list-([^(]+)\\(([^:]+):([^:]+)\\)")
             )
         )
+        @report_errors
         async def channels_pagination_handler(event: CallbackQuery.Event):
             if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
@@ -590,6 +615,7 @@ async def main():
             )
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=SUBSCRIBE_CMD.epilog))
+        @report_errors
         async def subscribe_handler(event: NewMessage.Event):
             if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
@@ -604,6 +630,7 @@ async def main():
             await process_subscribe(event, session, bot_client, args)
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD.epilog))
+        @report_errors
         async def unsubscribe_handler(event: NewMessage.Event):
             if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
@@ -627,6 +654,7 @@ async def main():
             )
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=SYNC_CMD.epilog))
+        @report_errors
         async def sync_handler(event: NewMessage.Event):
             if not (session := await auth_manager.ensure_authorized(event.sender_id)):
                 return
@@ -651,6 +679,7 @@ async def main():
                 )
 
         @bot_client.on(events.NewMessage(incoming=True, pattern="^[^/].+"))
+        @report_errors
         async def common_message_handler(event: NewMessage.Event):
             await auth_manager.feed_message(event.sender_id, event)
 

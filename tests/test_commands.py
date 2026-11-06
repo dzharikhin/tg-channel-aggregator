@@ -451,6 +451,128 @@ async def test_subscribed_channel_list_reports_unavailable_channels(data_path):
     assert f"Unavailable: {MARKED_SRC}" in message_text
 
 
+class FakeDialog:
+    def __init__(self, entity, date, is_channel=True, is_group=False, is_user=False):
+        self.entity = entity
+        self.date = date
+        self.is_channel = is_channel
+        self.is_group = is_group
+        self.is_user = is_user
+
+
+class FakeDialogsClient:
+    def __init__(self, dialogs):
+        self.dialogs = dialogs
+
+    def iter_dialogs(self, **kwargs):
+        async def _gen():
+            for dialog in self.dialogs:
+                yield dialog
+
+        return _gen()
+
+
+async def test_get_all_channels_page_returns_entities_and_filters_non_channels():
+    channel_entity = SimpleNamespace(id=SRC)
+    group_entity = SimpleNamespace(id=300)
+    user_entity = SimpleNamespace(id=400)
+    dialogs_client = FakeDialogsClient(
+        [
+            FakeDialog(group_entity, datetime(2026, 1, 1), is_group=True),
+            FakeDialog(channel_entity, datetime(2026, 1, 2)),
+            FakeDialog(
+                user_entity, datetime(2026, 1, 3), is_channel=False, is_user=True
+            ),
+        ]
+    )
+
+    channels_page, offset_stack, previous_offset, next_offset = (
+        await channels.get_all_channels_page(dialogs_client, [], None)
+    )
+
+    assert channels_page == [channel_entity]
+    assert previous_offset is None
+    assert next_offset is None  # fewer items than the page size
+
+
+async def test_get_all_channels_page_offset_comes_from_dialog_date(monkeypatch):
+    monkeypatch.setattr(config, "dialog_list_page_size", 1)
+    channel_entity = SimpleNamespace(id=SRC)
+    dialogs_client = FakeDialogsClient(
+        [FakeDialog(channel_entity, datetime(2026, 5, 5, 12, 30))]
+    )
+
+    channels_page, _, _, next_offset = await channels.get_all_channels_page(
+        dialogs_client, [], None
+    )
+
+    assert next_offset == datetime(2026, 5, 5, 12, 30).timestamp()
+
+
+async def test_format_channel_response_renders_marked_ids_and_user_names():
+    channel_entity = Channel(
+        id=SRC,
+        title="the ch",
+        access_hash=1,
+        photo=ChatPhotoEmpty(),
+        date=datetime(2026, 1, 1),
+    )
+    user_entity = User(id=999, first_name="Alice")
+
+    message_text, buttons, _ = await channels.format_channel_response(
+        "all", [channel_entity, user_entity], [-1], None, None, {}
+    )
+
+    assert "the ch" in message_text
+    assert f"`{MARKED_SRC}`" in message_text
+    assert "Alice" in message_text
+    assert "`999`" in message_text
+
+
+async def test_report_errors_replies_and_swallows_exceptions():
+    responses = []
+
+    class FakeErrEvent:
+        async def respond(self, text, **kwargs):
+            responses.append(text)
+
+    @client.report_errors
+    async def failing(event):
+        raise ValueError("boom")
+
+    await failing(FakeErrEvent())
+
+    assert responses == [
+        "Internal error while processing the command, it has been logged"
+    ]
+
+
+async def test_report_errors_falls_back_to_callback_answer():
+    answers = []
+
+    class FakeCallbackEvent:
+        async def answer(self, text, **kwargs):
+            answers.append(text)
+
+    @client.report_errors
+    async def failing(event):
+        raise ValueError("boom")
+
+    await failing(FakeCallbackEvent())
+
+    assert answers == [
+        "Internal error while processing the command, it has been logged"
+    ]
+
+
+async def test_report_errors_passes_through_result():
+    @client.report_errors
+    async def ok(event):
+        return "done"
+
+    assert await ok(object()) == "done"
+
+
 def test_requeue_sync_with_progress():
     cmd = {"cmd": "sync", "channel_id": SRC, "from": "full"}
     queue = FakeQueue([cmd])

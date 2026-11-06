@@ -5,7 +5,6 @@ from typing import Literal, Optional
 
 from telethon import Button, TelegramClient, functions, utils
 from telethon.errors import RPCError
-from telethon.tl.custom import Dialog
 from telethon.tl.types import DocumentAttributeFilename
 
 import config
@@ -20,9 +19,10 @@ async def get_all_channels_page(
     user_client: TelegramClient,
     offset_stack: list[float],
     action: Optional[tuple[float, Literal["backward", "forward"]]],
-) -> tuple[list[Dialog], list[float | None], Optional[float], Optional[float]]:
+) -> tuple[list[object], list[float | None], Optional[float], Optional[float]]:
     target_offset, action_type = action if action else (None, None)
     channels = []
+    last_dialog_date = None
     async for dialog in user_client.iter_dialogs(
         archived=False,
         ignore_migrated=True,
@@ -34,8 +34,9 @@ async def get_all_channels_page(
     ):
         if dialog.is_channel and not dialog.is_group and not dialog.is_user:
             channels.append(
-                dialog
-            )  # dialog.entity.admin_rights.post_messages = True to get sinkable
+                dialog.entity
+            )  # entity.admin_rights.post_messages = True to get sinkable
+            last_dialog_date = dialog.date
         if len(channels) >= config.dialog_list_page_size:
             break
 
@@ -43,7 +44,7 @@ async def get_all_channels_page(
         previous_offset = None
         offset_stack.append(-1)
         next_offset = (
-            channels[-1].date.timestamp()
+            last_dialog_date.timestamp()
             if len(channels) >= config.dialog_list_page_size
             else None
         )
@@ -51,14 +52,14 @@ async def get_all_channels_page(
         previous_offset = offset_stack[-1] if offset_stack else None
         offset_stack.append(target_offset)
         next_offset = (
-            channels[-1].date.timestamp()
+            last_dialog_date.timestamp()
             if len(channels) >= config.dialog_list_page_size
             else None
         )
     elif "backward" == action_type:
         offset_stack.pop()
         next_offset = (
-            channels[-1].date.timestamp()
+            last_dialog_date.timestamp()
             if len(channels) >= config.dialog_list_page_size
             else None
         )
@@ -174,7 +175,7 @@ async def build_subscribed_channel_response(
 
 async def format_channel_response(
     request_type: str,
-    items: list[Dialog] | list[object],
+    items: list[object],
     offset_stack: list[float | None] | list[int],
     previous_offset: Optional[float],
     next_offset: Optional[float],
