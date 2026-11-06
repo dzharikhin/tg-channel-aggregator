@@ -111,6 +111,7 @@ def create_subscription(
     sink: tuple[int, str],
     subscription_filter: tuple[str, str],
     caption: str = "link",
+    via: str = "bot",
     schedule: str | None = None,
     start_message_id: int | None = None,
     batch: int = 1,
@@ -137,6 +138,8 @@ def create_subscription(
     }
     if schedule:
         sink_config["schedule"] = schedule
+    if via != "bot":
+        sink_config["via"] = via
     if start_message_id is not None:
         sink_config["start_message_id"] = start_message_id
     if batch != 1:

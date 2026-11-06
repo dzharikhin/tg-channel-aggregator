@@ -35,6 +35,8 @@ logger.setLevel(logging.DEBUG)
 
 CAPTION_MODES = {"none", "link", "original"}
 
+SEND_VIA_MODES = {"bot", "user"}
+
 
 class Filter:
     def filter_message(self, message) -> bool:
@@ -139,6 +141,11 @@ class Sink(Filter):
                 f"Unknown caption mode {self.caption} for sink {self.id}, must be one of {sorted(CAPTION_MODES)}"
             )
         self.filter = Filter.get_filter(**sink_cfg["filter"])
+        self.via = sink_cfg.get("via", "bot")
+        if self.via not in SEND_VIA_MODES:
+            raise ValueError(
+                f"Unknown send mode {self.via} for sink {self.id}, must be one of {sorted(SEND_VIA_MODES)}"
+            )
         self.schedule = sink_cfg.get("schedule")
         self.start_message_id = sink_cfg.get("start_message_id")
         self.batch = sink_cfg.get("batch", 1)
@@ -148,7 +155,7 @@ class Sink(Filter):
         return self.filter.filter_message(message)
 
     def __repr__(self):
-        return f"Sink[id={self.id}, name={self.name}, filter={self.filter}]"
+        return f"Sink[id={self.id}, name={self.name}, via={self.via}, filter={self.filter}]"
 
 
 class Outcome(str, enum.Enum):
@@ -245,15 +252,16 @@ async def deliver_to_sink(
             f"Message {message.id} for user {user_id} is already in {sink}, skipping"
         )
         return DeliveryResult(Outcome.SKIPPED_DUPLICATE)
+    sender = user_client if "user" == sink.via else bot_client
     for attempt in (1, 2):
         try:
             await get_pacer().wait()
-            await bot_client.send_file(
+            await sender.send_file(
                 sink.id,
                 message.media,
                 caption=build_caption(sink.caption, message),
             )
-            logger.debug(f"Forwarded message {message.id} to {sink} via bot")
+            logger.debug(f"Forwarded message {message.id} to {sink} via {sink.via}")
             return DeliveryResult(Outcome.SENT)
         except FloodWaitError as e:
             if attempt == 2:
@@ -284,9 +292,10 @@ async def deliver_to_sink(
 def dm_text_for_failure(sink: Sink, key: str) -> str:
     kind, _, rest = key.partition(":")
     if "send-perm" == kind:
+        who = "Your account" if "user" == sink.via else "Bot"
         return (
-            f"Bot has no permission to send messages in {sink.name}({sink.id}). "
-            f"Grant the bot post rights or /unsubscribe."
+            f"{who} has no permission to send messages in {sink.name}({sink.id}). "
+            f"Grant post rights or /unsubscribe."
         )
     if "send-flood" == kind:
         return (

@@ -170,6 +170,8 @@ class FakeUserClient:
         self.sink_history = list(sink_history)
         self.iter_errors = list(iter_errors or [])
         self.call_times = call_times
+        self.sent_files = []
+        self.file_errors = []
 
     def _track_call(self):
         if self.call_times is not None:
@@ -178,6 +180,12 @@ class FakeUserClient:
     async def __call__(self, request):
         chats = self.chats if self.chats is not None else [SimpleNamespace(id=SRC)]
         return SimpleNamespace(chats=chats)
+
+    async def send_file(self, sink_id, media, caption=None):
+        self._track_call()
+        if self.file_errors:
+            raise self.file_errors.pop(0)
+        self.sent_files.append((sink_id, media, caption))
 
     async def get_entity(self, entity):
         if self.get_entity_error is not None:

@@ -27,6 +27,7 @@ from notifications import enqueue_error_dm
 from scheduler import run_scheduled_forwardings
 from subscription import (
     CAPTION_MODES,
+    SEND_VIA_MODES,
     ChannelHistoryError,
     forward_channel_history,
     handler_channel_ids,
@@ -254,6 +255,7 @@ async def process_subscribe(
         (args.dst_channel_id, entity_name(sink_entity)),
         (args.filter_type, args.filter_params),
         caption=args.caption,
+        via=args.via,
         schedule=args.schedule,
         start_message_id=args.start_message_id,
         batch=args.batch,
@@ -377,6 +379,15 @@ SUBSCRIBE_CMD = (
         choices=sorted(CAPTION_MODES),
         default="link",
         help="caption for forwarded media: none - no caption, link - link to original message (default), original - original message text",
+    ),
+    parser.add_argument(
+        "-v",
+        "--via",
+        required=False,
+        type=str,
+        choices=sorted(SEND_VIA_MODES),
+        default="bot",
+        help="account that sends messages to the sink: bot (default) or user - your own account",
     ),
     parser.add_argument(
         "-r",

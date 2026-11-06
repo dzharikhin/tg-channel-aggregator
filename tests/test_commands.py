@@ -260,6 +260,18 @@ def test_parse_args_schedule_defaults():
     assert args.batch == 1
 
 
+def test_parse_args_via():
+    args, err = client._parse_args(
+        client.SUBSCRIBE_CMD, "-s 1 -d 2 -f mp3 -p {} -v user"
+    )
+    assert err is None
+    assert args.via == "user"
+
+    args, err = client._parse_args(client.SUBSCRIBE_CMD, "-s 1 -d 2 -f mp3 -p {}")
+    assert err is None
+    assert args.via == "bot"
+
+
 def test_parse_args_rejects_invalid_cron():
     args, err = client._parse_args(
         client.SUBSCRIBE_CMD, "-s 1 -d 2 -f mp3 -p {} -r nonsense"
@@ -311,6 +323,20 @@ async def test_subscribe_creates_subscription_when_bot_may_post(data_path):
     assert event.responses[0].startswith(f"subscribed {MARKED_SRC} -> {MARKED_DST}")
     sinks = config.get_channel_subscriptions(USER_ID, MARKED_SRC)
     assert [sink.name for sink in sinks] == ["the sink"]
+    assert [sink.via for sink in sinks] == ["bot"]
+
+
+async def test_subscribe_creates_user_via_subscription(data_path):
+    event = FakeSubscribeEvent()
+    bot = FakeBot(entities={MARKED_DST: peer_channel(title="the sink")})
+    args = subscribe_args()
+    args.via = "user"
+
+    await client.process_subscribe(event, session_with_readable_src(), bot, args)
+
+    assert event.responses[0].startswith(f"subscribed {MARKED_SRC} -> {MARKED_DST}")
+    sinks = config.get_channel_subscriptions(USER_ID, MARKED_SRC)
+    assert [sink.via for sink in sinks] == ["user"]
 
 
 async def test_subscribe_creates_subscription_to_megagroup(data_path):

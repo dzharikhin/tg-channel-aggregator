@@ -35,20 +35,18 @@ from subscription import (
 MARKED_SRC = -1000000000100
 
 
-def make_sink(sink_id=DST, caption="link"):
-    return Sink(
-        str(sink_id),
-        json.dumps(
-            {
-                "sink_name": f"sink{sink_id}",
-                "caption": caption,
-                "filter": {
-                    "type": "mp3",
-                    "params": {"min_seconds": 10, "max_seconds": 600},
-                },
-            }
-        ),
-    )
+def make_sink(sink_id=DST, caption="link", via="bot"):
+    sink_config = {
+        "sink_name": f"sink{sink_id}",
+        "caption": caption,
+        "filter": {
+            "type": "mp3",
+            "params": {"min_seconds": 10, "max_seconds": 600},
+        },
+    }
+    if via != "bot":
+        sink_config["via"] = via
+    return Sink(str(sink_id), json.dumps(sink_config))
 
 
 def recorded_sleep(monkeypatch):
@@ -106,6 +104,39 @@ async def test_dedup_read_failure_fails_closed_and_enqueues_dm():
     await forward_to_sinks(USER_ID, user_client, mp3_message(5), [make_sink()], bot)
     assert bot.sent_files == []
     assert [dm.key for dm in pending_dms()] == [f"dedup-read-fail:{DST}"]
+
+
+async def test_user_via_sends_with_user_client():
+    user_client = FakeUserClient()
+    bot = FakeBot()
+    sink = make_sink(via="user")
+    result = await deliver_to_sink(USER_ID, user_client, bot, sink, mp3_message(5))
+    assert result.outcome == Outcome.SENT
+    assert len(user_client.sent_files) == 1
+    assert bot.sent_files == []
+
+
+async def test_user_via_dedup_still_reads_user_history():
+    source = mp3_message(5, document_id=101)
+    user_client = FakeUserClient(sink_history=[sink_message(1, media=source.media)])
+    bot = FakeBot()
+    result = await deliver_to_sink(
+        USER_ID, user_client, bot, make_sink(via="user"), source
+    )
+    assert result.outcome == Outcome.SKIPPED_DUPLICATE
+    assert user_client.sent_files == []
+    assert bot.sent_files == []
+
+
+async def test_user_via_permission_error_dm_names_the_account():
+    user_client = FakeUserClient()
+    user_client.file_errors = [ChatWriteForbiddenError(None)]
+    bot = FakeBot()
+    sink = make_sink(via="user")
+    await forward_to_sinks(USER_ID, user_client, mp3_message(5), [sink], bot)
+    dms = pending_dms()
+    assert [dm.key for dm in dms] == [f"send-perm:{DST}"]
+    assert "Your account has no permission" in dms[0].text
 
 
 async def test_floodwait_once_then_sent(monkeypatch):

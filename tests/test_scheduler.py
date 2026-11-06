@@ -185,6 +185,17 @@ async def test_dedup_skip_advances_pointer_without_dm(data_path):
     assert pending_dms() == []
 
 
+async def test_user_via_scheduled_step_sends_with_user_client(data_path):
+    sink = make_scheduled_sink(data_path, start_message_id=1, via="user")
+    user_client = FakeUserClient([mp3_message(1), mp3_message(2)])
+    bot = FakeBot()
+
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+
+    assert len(user_client.sent_files) == 1
+    assert bot.sent_files == []
+
+
 async def test_no_new_messages_is_a_noop(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=3)
     user_client = FakeUserClient([mp3_message(1), mp3_message(2), mp3_message(3)])
