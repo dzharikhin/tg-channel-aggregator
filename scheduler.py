@@ -4,13 +4,18 @@ from datetime import datetime
 
 from croniter import croniter
 from telethon import TelegramClient
-from telethon.errors import RPCError
 from telethon.tl.functions.channels import GetChannelsRequest
 
 import config
+import notifications
 from auth import AuthManager
 from common import unwrap_single_chat
-from subscription import Sink, build_caption
+from subscription import (
+    Outcome,
+    Sink,
+    deliver_to_sink,
+    dm_text_for_failure,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.DEBUG)
@@ -66,27 +71,19 @@ async def forward_step(
             # batch is full: leave the rest, starting from this message,
             # for the next scheduled run
             break
-        try:
-            result = await user_client.send_file(
-                sink.id,
-                message.media,
-                caption=build_caption(sink.caption, message),
-            )
-            logger.debug(f"Forwarded {message} to {sink} with result {result}")
-        except RPCError as e:
-            logger.warning(
-                f"User {user_id} has no permission to send messages in {sink.name}({sink.id})",
-                exc_info=e,
-            )
-            await bot_client.send_message(
-                user_id,
-                f"You have no permission to send messages in {sink.name}(`{sink.id}`). Please, grant permission or unsubscribe",
-            )
-            # pointer stays before the failed message: it is retried on the
-            # next scheduled run
-            break
-        sent += 1
+        result = await deliver_to_sink(user_id, bot_client, sink, message)
+        # the pointer advances past EVERY examined message, failed ones
+        # included: failed sends are not retried
         state["last_forwarded_message_id"] = message.id
+        if result.outcome == Outcome.SENT:
+            sent += 1
+        elif result.outcome == Outcome.FAILED and result.key:
+            state["last_send_error"] = f"{datetime.now().isoformat()} {result.key}"
+            notifications.enqueue_error_dm(
+                user_id, result.key, dm_text_for_failure(sink, result.key)
+            )
+            if result.stop_step:
+                break
         config.update_sink_state(user_id, source_channel_id, sink.id, state)
     state["last_run_at"] = now.isoformat()
     config.update_sink_state(user_id, source_channel_id, sink.id, state)

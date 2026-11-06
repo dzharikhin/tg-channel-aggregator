@@ -20,13 +20,16 @@ from telethon.tl.functions.channels import GetChannelsRequest
 from telethon.tl.types import Chat
 
 import config
+import notifications
 from auth import AuthManager
 from channels import build_all_channel_response, build_subscribed_channel_response
 from common import unwrap_single_chat
+from notifications import enqueue_error_dm
 from scheduler import run_scheduled_forwardings
 from subscription import (
     CAPTION_MODES,
-    forward_to_sinks,
+    ChannelHistoryError,
+    forward_channel_history,
     handler_channel_ids,
     subscribe_to_channel,
     unsubscribe_from_channel,
@@ -60,10 +63,27 @@ async def check_clients_consistency(
                 "Exception on consistency check, continue",
                 exc_info=e,
             )
-            await bot_client.send_message(
-                config.owner_user_id, "exception on consistency check"
+            enqueue_error_dm(
+                config.owner_user_id,
+                "consistency-fail",
+                "exception on consistency check",
             )
         await asyncio.sleep(config.user_client_check_period_seconds)
+
+
+def requeue_sync_with_progress(
+    queue: persistqueue.SQLiteAckQueue, cmd: dict, last_processed_id: int | None
+) -> None:
+    queue.ack(cmd)
+    queue.put(
+        {
+            "cmd": "sync",
+            "channel_id": cmd["channel_id"],
+            "from": last_processed_id
+            if last_processed_id is not None
+            else cmd["from"],
+        }
+    )
 
 
 async def handle_queue_tasks(
@@ -77,30 +97,20 @@ async def handle_queue_tasks(
         try:
             cmd = queue.get_nowait()
             if "sync" == cmd["cmd"]:
-                channel_id = cmd["channel_id"]
-                channel = unwrap_single_chat(
-                    await user_client(GetChannelsRequest(id=[int(channel_id)]))
+                from_offset = cmd["from"]
+                if isinstance(from_offset, int):
+                    min_id = from_offset - 1
+                elif "full" == from_offset:
+                    min_id = None
+                else:
+                    raise ValueError(f"unknown <from> cmd: {cmd["from"]}")
+                await forward_channel_history(
+                    user_id,
+                    user_client,
+                    bot_client,
+                    cmd["channel_id"],
+                    min_id,
                 )
-                if not channel:
-                    raise ValueError(f"Channel {channel_id} is not available")
-                sinks = config.get_channel_subscriptions(user_id, channel_id)
-                if sinks:
-                    iter_params = {}
-                    from_offset = cmd["from"]
-                    if isinstance(from_offset, int):
-                        iter_params["min_id"] = from_offset - 1
-                    elif "full" == from_offset:
-                        pass
-                    else:
-                        raise ValueError(f"unknown <from> cmd: {cmd["from"]}")
-                    await user_client.end_takeout(False)
-                    async with user_client.takeout(channels=True) as takeout_client:
-                        async for message in takeout_client.iter_messages(
-                            channel, reverse=True, **iter_params
-                        ):
-                            await forward_to_sinks(
-                                user_id, user_client, message, sinks, bot_client
-                            )
                 queue.ack(cmd)
             else:
                 raise ValueError(f"unknown cmd: {cmd}")
@@ -112,13 +122,25 @@ async def handle_queue_tasks(
                 f"cannot handle {cmd_id}: {cmd} - marked as failed",
                 exc_info=e,
             )
-            await bot_client.send_message(user_id, f"Failed to execute {cmd}: {e}")
-        except RPCError as e:
-            cmd_id = queue.nack(cmd)
+            enqueue_error_dm(
+                user_id,
+                f"cmd-fail:{cmd.get("cmd")}:{cmd.get("channel_id")}",
+                f"Failed to execute {cmd}: {e}",
+            )
+        except ChannelHistoryError as e:
             logger.info(
-                f"{cmd_id}: {cmd} - failed with {type(e)}, going to retry",
+                f"{cmd} - failed with {type(e.cause).__name__}, requeued from progress",
                 exc_info=e,
             )
+            requeue_sync_with_progress(queue, cmd, e.last_processed_id)
+            enqueue_error_dm(
+                user_id,
+                f"sync-fail:{cmd["channel_id"]}",
+                f"Sync of channel {cmd["channel_id"]} failed with "
+                f"{type(e.cause).__name__} and was requeued from message "
+                f"{e.last_processed_id or cmd["from"]}.",
+            )
+            await asyncio.sleep(config.queue_retry_backoff_seconds)
 
 
 async def ensure_clients_consistency(
@@ -166,7 +188,51 @@ async def ensure_clients_consistency(
 
 
 def has_send_message_permission(chat: Chat):
-    return chat.admin_rights.post_messages if chat else False
+    return bool(chat and chat.admin_rights and chat.admin_rights.post_messages)
+
+
+async def process_subscribe(
+    event: NewMessage.Event,
+    session,
+    bot_client: TelegramClient,
+    args: Namespace,
+):
+    logger.debug(
+        f"subscribing user {event.sender_id}: {args.src_channel_id} -> {args.dst_channel_id} with filter {args.filter_type}({args.filter_params})"
+    )
+    channel = None
+    try:
+        channel = unwrap_single_chat(
+            await bot_client(GetChannelsRequest(id=[args.dst_channel_id]))
+        )
+    except RPCError as e:
+        logger.warning(
+            f"Bot cannot access sink channel {args.dst_channel_id}", exc_info=e
+        )
+    if not channel or not has_send_message_permission(channel):
+        await event.respond(
+            f"Bot has no permission to post in {args.dst_channel_id}. "
+            f"Add the bot as admin with post rights and retry."
+        )
+        return
+
+    config.create_subscription(
+        event.sender_id,
+        args.src_channel_id,
+        (args.dst_channel_id, channel.title),
+        (args.filter_type, args.filter_params),
+        caption=args.caption,
+        schedule=args.schedule,
+        start_message_id=args.start_message_id,
+        batch=args.batch,
+    )
+    subscribe_to_channel(
+        event.sender_id, session.user_client, args.src_channel_id, bot_client
+    )
+    await event.respond(
+        f"subscribed {args.src_channel_id} -> {args.dst_channel_id}"
+        + (f" on schedule {args.schedule!r}" if args.schedule else "")
+    )
 
 
 def jsonarg(arg: str) -> str:
@@ -491,35 +557,7 @@ async def main():
                 await event.respond(help_to_print)
                 return
 
-            logger.debug(
-                f"subscribing user {event.sender_id}: {args.src_channel_id} -> {args.dst_channel_id} with filter {args.filter_type}({args.filter_params})"
-            )
-            channel = unwrap_single_chat(
-                await session.user_client(GetChannelsRequest(id=[args.dst_channel_id]))
-            )
-            if not has_send_message_permission(channel):
-                await event.respond(
-                    f"You have no permission to send messages in {args.dst_channel_id}"
-                )
-                return
-
-            config.create_subscription(
-                event.sender_id,
-                args.src_channel_id,
-                (args.dst_channel_id, channel.title),
-                (args.filter_type, args.filter_params),
-                caption=args.caption,
-                schedule=args.schedule,
-                start_message_id=args.start_message_id,
-                batch=args.batch,
-            )
-            subscribe_to_channel(
-                event.sender_id, session.user_client, args.src_channel_id, bot_client
-            )
-            await event.respond(
-                f"subscribed {args.src_channel_id} -> {args.dst_channel_id}"
-                + (f" on schedule {args.schedule!r}" if args.schedule else "")
-            )
+            await process_subscribe(event, session, bot_client, args)
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD.epilog))
         async def unsubscribe_handler(event: NewMessage.Event):
@@ -578,6 +616,9 @@ async def main():
         )
         tasks["scheduled_forwarding"] = asyncio.create_task(
             run_scheduled_forwardings(auth_manager, bot_client)
+        )
+        tasks["dm_processor"] = asyncio.create_task(
+            notifications.run_dm_processor(bot_client)
         )
         await bot_client.run_until_disconnected()
     for task in tasks.values():

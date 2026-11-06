@@ -1,94 +1,23 @@
 import json
 from datetime import datetime
-from types import SimpleNamespace
 
-import pytest
-from telethon.errors import RPCError
-from telethon.tl.types import (
-    Document,
-    DocumentAttributeAudio,
-    Message,
-    MessageMediaDocument,
-    MessageMediaPhoto,
-    PeerChannel,
+from fakes import (
+    DST,
+    MP3_PARAMS,
+    SRC,
+    USER_ID,
+    FakeBot,
+    FakeUserClient,
+    mp3_message,
+    pending_dms,
+    photo_message,
+    sink_message,
 )
+from telethon.errors import ChatWriteForbiddenError
 
 import config
 import scheduler
 from subscription import Sink, forward_to_sinks
-
-USER_ID = 42
-SRC = 100
-DST = 200
-MP3_PARAMS = '{"min_seconds": 10, "max_seconds": 600}'
-
-
-def mp3_message(id, duration=100):
-    document = Document(
-        id=1,
-        access_hash=2,
-        file_reference=b"",
-        date=datetime(2026, 1, 1),
-        mime_type="audio/mpeg",
-        size=100,
-        dc_id=1,
-        attributes=[DocumentAttributeAudio(voice=False, duration=duration)],
-    )
-    return Message(
-        id=id,
-        peer_id=PeerChannel(channel_id=SRC),
-        media=MessageMediaDocument(document=document),
-    )
-
-
-def photo_message(id):
-    return Message(
-        id=id, peer_id=PeerChannel(channel_id=SRC), media=MessageMediaPhoto()
-    )
-
-
-class FakeUserClient:
-    def __init__(self, messages=()):
-        self.messages = sorted(messages, key=lambda m: m.id)
-        self.sent = []
-        self.error_on_send = None
-
-    async def __call__(self, request):
-        return SimpleNamespace(chats=[SimpleNamespace(id=SRC)])
-
-    async def get_messages(self, entity, limit=1):
-        return self.messages[-limit:] if self.messages else []
-
-    def iter_messages(self, entity, min_id=None, reverse=False):
-        msgs = [m for m in self.messages if m.id > (min_id or 0)]
-        if not reverse:
-            msgs = list(reversed(msgs))
-
-        async def _gen():
-            for m in msgs:
-                yield m
-
-        return _gen()
-
-    async def send_file(self, sink_id, media, caption=None):
-        if self.error_on_send:
-            raise self.error_on_send
-        self.sent.append((sink_id, media, caption))
-
-
-class FakeBot:
-    def __init__(self):
-        self.sent = []
-
-    async def send_message(self, user_id, text, *args, **kwargs):
-        self.sent.append((user_id, text))
-
-
-@pytest.fixture
-def data_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "data_path", tmp_path)
-    tmp_path.joinpath(str(USER_ID)).mkdir()
-    return tmp_path
 
 
 def make_scheduled_sink(data_path, **kwargs):
@@ -139,10 +68,11 @@ def test_is_due_false_before_next_occurrence():
 async def test_first_run_without_start_skips_whole_history(data_path):
     sink = make_scheduled_sink(data_path)
     user_client = FakeUserClient([mp3_message(1), mp3_message(2)])
+    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, FakeBot(), SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
 
-    assert user_client.sent == []
+    assert bot.sent_files == []
     state = read_state(data_path)
     assert state["last_forwarded_message_id"] == 2
     assert state["last_run_at"] == NOW.isoformat()
@@ -150,12 +80,15 @@ async def test_first_run_without_start_skips_whole_history(data_path):
 
 async def test_start_message_id_defines_first_candidates(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=1)
-    user_client = FakeUserClient([mp3_message(1), mp3_message(2), mp3_message(3)])
+    user_client = FakeUserClient(
+        [mp3_message(1), mp3_message(2), mp3_message(3)]
+    )
+    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, FakeBot(), SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
 
     # default batch is 1: only the next matching message is forwarded
-    assert len(user_client.sent) == 1
+    assert len(bot.sent_files) == 1
     assert read_state(data_path)["last_forwarded_message_id"] == 2
 
 
@@ -164,10 +97,11 @@ async def test_batch_forwards_several_messages_per_run(data_path):
     user_client = FakeUserClient(
         [mp3_message(1), mp3_message(2), mp3_message(3), mp3_message(4)]
     )
+    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, FakeBot(), SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
 
-    assert len(user_client.sent) == 2
+    assert len(bot.sent_files) == 2
     assert read_state(data_path)["last_forwarded_message_id"] == 3
     # 4th message stays for the next run
 
@@ -175,50 +109,93 @@ async def test_batch_forwards_several_messages_per_run(data_path):
 async def test_next_run_resumes_after_drip_feed_pointer(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=1)
     user_client = FakeUserClient([mp3_message(1), mp3_message(2), mp3_message(3)])
+    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, FakeBot(), SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
     sink = config.get_channel_subscriptions(USER_ID, SRC)[0]
-    await scheduler.forward_step(USER_ID, user_client, FakeBot(), SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
 
-    assert len(user_client.sent) == 2
+    assert len(bot.sent_files) == 2
 
 
 async def test_non_matching_tail_is_skipped_not_rescanned(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=0)
-    user_client = FakeUserClient([mp3_message(1), photo_message(2), photo_message(3)])
-
-    await scheduler.forward_step(USER_ID, user_client, FakeBot(), SRC, sink, NOW)
-
-    assert len(user_client.sent) == 1
-    # history exhausted: pointer moves to the newest examined message
-    assert read_state(data_path)["last_forwarded_message_id"] == 3
-
-
-async def test_send_failure_notifies_and_keeps_failed_message(data_path):
-    sink = make_scheduled_sink(data_path, start_message_id=0, batch=2)
-    user_client = FakeUserClient([photo_message(1), mp3_message(2), mp3_message(3)])
-    user_client.error_on_send = RPCError(None, "no write rights")
+    user_client = FakeUserClient(
+        [mp3_message(1), photo_message(2), photo_message(3)]
+    )
     bot = FakeBot()
 
     await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
 
-    assert user_client.sent == []
-    assert len(bot.sent) == 1
+    assert len(bot.sent_files) == 1
+    # history exhausted: pointer moves to the newest examined message
+    assert read_state(data_path)["last_forwarded_message_id"] == 3
+
+
+async def test_send_failure_advances_pointer_enqueues_dm_and_continues(data_path):
+    sink = make_scheduled_sink(data_path, start_message_id=0, batch=2)
+    user_client = FakeUserClient([photo_message(1), mp3_message(2), mp3_message(3)])
+    bot = FakeBot()
+    bot.file_errors = [RuntimeError("boom")]
+
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+
+    # message 2 failed permanently, message 3 was still processed
+    assert len(bot.sent_files) == 1
     state = read_state(data_path)
-    # non-matching message before the failure is skipped, the failed one
-    # stays the first candidate for the next run
-    assert state["last_forwarded_message_id"] == 1
-    # the run counts as done: retry happens on the next cron occurrence
+    assert state["last_forwarded_message_id"] == 3
+    # the run counts as done: no retry of the failed message
     assert state["last_run_at"] == NOW.isoformat()
+    assert "send-unknown:200:RuntimeError" in state["last_send_error"]
+    assert [dm.key for dm in pending_dms()] == ["send-unknown:200:RuntimeError"]
+
+
+async def test_permission_failure_stops_step_and_enqueues_dm(data_path):
+    sink = make_scheduled_sink(data_path, start_message_id=0, batch=2)
+    user_client = FakeUserClient([photo_message(1), mp3_message(2), mp3_message(3)])
+    bot = FakeBot()
+    bot.file_errors = [ChatWriteForbiddenError(None)]
+
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+
+    assert bot.sent_files == []
+    state = read_state(data_path)
+    # pointer advances PAST the failed message, but the step stops
+    assert state["last_forwarded_message_id"] == 2
+    assert state["last_run_at"] == NOW.isoformat()
+    assert "send-perm:200" in state["last_send_error"]
+    assert [dm.key for dm in pending_dms()] == ["send-perm:200"]
+
+
+async def test_dedup_skip_advances_pointer_without_dm(data_path):
+    sink = make_scheduled_sink(data_path, start_message_id=0, batch=5)
+    duplicated = mp3_message(2, document_id=102, file_name="2.mp3", size=102)
+    user_client = FakeUserClient(
+        [
+            mp3_message(1, document_id=101, file_name="1.mp3", size=101),
+            duplicated,
+            mp3_message(3, document_id=103, file_name="3.mp3", size=103),
+        ]
+    )
+    bot = FakeBot(history=[sink_message(7, media=duplicated.media)])
+
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+
+    # only the duplicated middle message is suppressed
+    assert len(bot.sent_files) == 2
+    state = read_state(data_path)
+    assert state["last_forwarded_message_id"] == 3
+    assert pending_dms() == []
 
 
 async def test_no_new_messages_is_a_noop(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=3)
     user_client = FakeUserClient([mp3_message(1), mp3_message(2), mp3_message(3)])
+    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, FakeBot(), SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
 
-    assert user_client.sent == []
+    assert bot.sent_files == []
     state = read_state(data_path)
     assert state["last_forwarded_message_id"] == 3
     assert state["last_run_at"] == NOW.isoformat()
@@ -244,13 +221,11 @@ async def test_forward_to_sinks_skips_scheduled_sinks():
             }
         ),
     )
-    user_client = FakeUserClient()
+    bot = FakeBot()
 
-    await forward_to_sinks(
-        USER_ID, user_client, mp3_message(5), [scheduled, realtime], FakeBot()
-    )
+    await forward_to_sinks(USER_ID, mp3_message(5), [scheduled, realtime], bot)
 
-    assert [sink_id for sink_id, _, _ in user_client.sent] == [DST + 1]
+    assert [sink_id for sink_id, _, _ in bot.sent_files] == [DST + 1]
 
 
 def test_create_subscription_writes_schedule_and_anchor(data_path):
