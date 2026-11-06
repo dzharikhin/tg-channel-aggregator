@@ -5,8 +5,7 @@ import time
 import unicodedata
 from typing import Optional
 
-from telethon.tl.types import Chat
-from telethon.tl.types.messages import Chats
+from telethon.tl.types import User
 
 _pacer: "Optional[Pacer]" = None
 
@@ -15,10 +14,10 @@ def is_debug():
     return "true" == os.getenv("DEBUG", "False").lower()
 
 
-def unwrap_single_chat(chat: Chats) -> Optional[Chat]:
-    if not chat or not chat.chats:
-        return None
-    return chat.chats[0]
+def entity_name(entity) -> str:
+    if isinstance(entity, User):
+        return entity.first_name or str(entity.id)
+    return entity.title
 
 
 def norm(s: Optional[str]) -> str:

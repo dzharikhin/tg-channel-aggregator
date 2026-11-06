@@ -18,11 +18,21 @@ from fakes import (
     photo_message,
 )
 from telethon.errors import ChannelPrivateError, RPCError
-from telethon.tl.types import Channel, ChatPhotoEmpty
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    ChatAdminRights,
+    ChatBannedRights,
+    ChatPhotoEmpty,
+    User,
+)
 
 import channels
 import client
 import config
+
+MARKED_SRC = -1000000000100
+MARKED_DST = -1000000000200
 
 
 class _Msg:
@@ -45,7 +55,7 @@ class FakeSubscribeEvent:
         self.responses.append(text)
 
 
-def subscribe_args(src=SRC, dst=DST):
+def subscribe_args(src=MARKED_SRC, dst=MARKED_DST):
     args, err = client._parse_args(
         client.SUBSCRIBE_CMD,
         f"-s {src} -d {dst} -f mp3 -p '{MP3_PARAMS}'",
@@ -54,10 +64,54 @@ def subscribe_args(src=SRC, dst=DST):
     return args
 
 
-def fake_channel(post_messages=True, title="sink channel"):
-    return SimpleNamespace(
+def peer_channel(id=DST, title="sink channel", post_messages=True):
+    return Channel(
+        id=id,
         title=title,
-        admin_rights=SimpleNamespace(post_messages=post_messages),
+        access_hash=1,
+        photo=ChatPhotoEmpty(),
+        date=datetime(2026, 1, 1),
+        admin_rights=ChatAdminRights(post_messages=post_messages),
+    )
+
+
+def peer_megagroup(id=DST, banned_send=False):
+    return Channel(
+        id=id,
+        title="the group",
+        access_hash=1,
+        megagroup=True,
+        photo=ChatPhotoEmpty(),
+        date=datetime(2026, 1, 1),
+        default_banned_rights=ChatBannedRights(
+            until_date=datetime(2030, 1, 1), send_messages=banned_send
+        ),
+    )
+
+
+def peer_chat(id=DST, banned_send=False):
+    return Chat(
+        id=id,
+        title="the chat",
+        photo=ChatPhotoEmpty(),
+        participants_count=2,
+        date=datetime(2026, 1, 1),
+        version=0,
+        default_banned_rights=ChatBannedRights(
+            until_date=datetime(2030, 1, 1), send_messages=banned_send
+        ),
+    )
+
+
+def peer_user(id=DST):
+    return User(id=id, first_name="the user")
+
+
+def session_with_readable_src():
+    return SimpleNamespace(
+        user_client=FakeHandlerClient(
+            entities={MARKED_SRC: peer_channel(id=SRC, title="the source")}
+        )
     )
 
 
@@ -120,6 +174,7 @@ def test_syncpairarg():
     assert fn("err", "123=456") == (123, 456)
     assert fn("err", "all=full") == ("all", "full")
     assert fn("err", "123=full") == (123, "full")
+    assert fn("err", "-1001234567890=full") == (-1001234567890, "full")
     with pytest.raises(ArgumentTypeError):
         fn("err", "x=y")
 
@@ -135,6 +190,52 @@ def test_cronarg():
     assert client.cronarg("*/15 * * * *") == "*/15 * * * *"
     with pytest.raises(ArgumentTypeError):
         client.cronarg("not a cron")
+
+
+def test_peerarg():
+    assert client.peerarg("1234567890") == 1234567890
+    assert client.peerarg("-1234567890") == -1234567890
+    assert client.peerarg("-1001234567890") == -1001234567890
+    with pytest.raises(ArgumentTypeError):
+        client.peerarg("abc")
+    with pytest.raises(ArgumentTypeError):
+        client.peerarg("0")
+
+
+def test_parse_args_accepts_marked_channel_ids():
+    args, err = client._parse_args(
+        client.SUBSCRIBE_CMD,
+        '-s -1001409731401 -d -1002439736204 -f mp3 -p "{}"',
+    )
+    assert err is None
+    assert args.src_channel_id == -1001409731401
+    assert args.dst_channel_id == -1002439736204
+
+
+def test_parse_args_sanitizes_typographic_quotes():
+    args, err = client._parse_args(
+        client.SUBSCRIBE_CMD,
+        '-s 1 -d 2 -f mp3 -p \u2018{"a": 1}\u2019 -c link',
+    )
+    assert err is None
+    assert args.filter_params == '{"a": 1}'
+
+
+def test_parse_args_failure_is_logged_with_raw_input(caplog):
+    args, err = client._parse_args(client.SUBSCRIBE_CMD, "-s abc -d 2 -f mp3 -p {}")
+
+    assert args is None
+    assert "usage:" in err
+    assert "cannot parse subscribe command" in caplog.text
+    assert "-s abc -d 2" in caplog.text
+
+
+def test_subscribe_usage_error_shows_single_quote_json_example():
+    args, err = client._parse_args(client.SUBSCRIBE_CMD, "-s")
+
+    assert args is None
+    assert "single-quoted JSON" in err
+    assert '\'{"min_seconds": 90, "max_seconds": 480}\'' in err
 
 
 def test_parse_args_schedule_options():
@@ -174,39 +275,86 @@ def test_build_help_covers_all_cmds_except_start():
 
 async def test_subscribe_checks_bot_permission(data_path):
     event = FakeSubscribeEvent()
-    bot = FakeBot(chats=[fake_channel(post_messages=False)])
+    bot = FakeBot(entities={MARKED_DST: peer_channel(post_messages=False)})
 
     await client.process_subscribe(
-        event, SimpleNamespace(user_client=FakeHandlerClient()), bot, subscribe_args()
+        event, session_with_readable_src(), bot, subscribe_args()
     )
 
     assert "no permission to post" in event.responses[0]
-    assert config.get_channel_subscriptions(USER_ID, SRC) == []
+    assert config.get_channel_subscriptions(USER_ID, MARKED_SRC) == []
 
 
 async def test_subscribe_unreachable_channel_reports_no_permission(data_path):
     event = FakeSubscribeEvent()
-    bot = FakeBot(call_error=ChannelPrivateError(None))
+    bot = FakeBot(get_entity_error=ChannelPrivateError(None))
 
     await client.process_subscribe(
-        event, SimpleNamespace(user_client=FakeHandlerClient()), bot, subscribe_args()
+        event, session_with_readable_src(), bot, subscribe_args()
     )
 
     assert "no permission to post" in event.responses[0]
-    assert config.get_channel_subscriptions(USER_ID, SRC) == []
+    assert config.get_channel_subscriptions(USER_ID, MARKED_SRC) == []
 
 
 async def test_subscribe_creates_subscription_when_bot_may_post(data_path):
     event = FakeSubscribeEvent()
-    bot = FakeBot(chats=[fake_channel(post_messages=True, title="the sink")])
+    bot = FakeBot(entities={MARKED_DST: peer_channel(title="the sink")})
 
     await client.process_subscribe(
-        event, SimpleNamespace(user_client=FakeHandlerClient()), bot, subscribe_args()
+        event, session_with_readable_src(), bot, subscribe_args()
     )
 
-    assert event.responses[0].startswith(f"subscribed {SRC} -> {DST}")
-    sinks = config.get_channel_subscriptions(USER_ID, SRC)
+    assert event.responses[0].startswith(f"subscribed {MARKED_SRC} -> {MARKED_DST}")
+    sinks = config.get_channel_subscriptions(USER_ID, MARKED_SRC)
     assert [sink.name for sink in sinks] == ["the sink"]
+
+
+async def test_subscribe_creates_subscription_to_megagroup(data_path):
+    event = FakeSubscribeEvent()
+    bot = FakeBot(entities={MARKED_DST: peer_megagroup()})
+
+    await client.process_subscribe(
+        event, session_with_readable_src(), bot, subscribe_args()
+    )
+
+    assert event.responses[0].startswith(f"subscribed {MARKED_SRC} -> {MARKED_DST}")
+    assert config.get_channel_subscriptions(USER_ID, MARKED_SRC)
+
+
+async def test_subscribe_creates_subscription_to_user_dm(data_path):
+    event = FakeSubscribeEvent()
+    bot = FakeBot(entities={MARKED_DST: peer_user()})
+
+    await client.process_subscribe(
+        event, session_with_readable_src(), bot, subscribe_args()
+    )
+
+    sinks = config.get_channel_subscriptions(USER_ID, MARKED_SRC)
+    assert [sink.name for sink in sinks] == ["the user"]
+
+
+async def test_subscribe_rejects_banned_group_sink(data_path):
+    event = FakeSubscribeEvent()
+    bot = FakeBot(entities={MARKED_DST: peer_chat(banned_send=True)})
+
+    await client.process_subscribe(
+        event, session_with_readable_src(), bot, subscribe_args()
+    )
+
+    assert "no permission to post" in event.responses[0]
+    assert config.get_channel_subscriptions(USER_ID, MARKED_SRC) == []
+
+
+def test_bot_can_write_by_peer_type():
+    assert client.bot_can_write(peer_channel(post_messages=True))
+    assert not client.bot_can_write(peer_channel(post_messages=False))
+    assert client.bot_can_write(peer_megagroup())
+    assert not client.bot_can_write(peer_megagroup(banned_send=True))
+    assert client.bot_can_write(peer_chat())
+    assert not client.bot_can_write(peer_chat(banned_send=True))
+    assert client.bot_can_write(peer_user())
+    assert not client.bot_can_write(object())
 
 
 async def test_subscribe_unreadable_source_reports_read_error(data_path):
@@ -216,26 +364,26 @@ async def test_subscribe_unreadable_source_reports_read_error(data_path):
             call_error=ValueError("Could not find the input entity")
         )
     )
-    bot = FakeBot(chats=[fake_channel(post_messages=True)])
+    bot = FakeBot(entities={MARKED_DST: peer_channel()})
 
     await client.process_subscribe(event, session, bot, subscribe_args())
 
     assert "READ access" in event.responses[0]
     assert "no permission" not in event.responses[0]
-    assert config.get_channel_subscriptions(USER_ID, SRC) == []
+    assert config.get_channel_subscriptions(USER_ID, MARKED_SRC) == []
 
 
 async def test_subscribe_unresolvable_sink_reports_write_error(data_path):
     event = FakeSubscribeEvent()
-    bot = FakeBot(call_error=ValueError("Could not find the input entity"))
+    bot = FakeBot()
 
     await client.process_subscribe(
-        event, SimpleNamespace(user_client=FakeHandlerClient()), bot, subscribe_args()
+        event, session_with_readable_src(), bot, subscribe_args()
     )
 
     assert "no permission to post" in event.responses[0]
     assert "READ access" not in event.responses[0]
-    assert config.get_channel_subscriptions(USER_ID, SRC) == []
+    assert config.get_channel_subscriptions(USER_ID, MARKED_SRC) == []
 
 
 async def test_subscribe_reports_read_and_write_errors_together(data_path):
@@ -243,19 +391,19 @@ async def test_subscribe_reports_read_and_write_errors_together(data_path):
     session = SimpleNamespace(
         user_client=FakeHandlerClient(call_error=ChannelPrivateError(None))
     )
-    bot = FakeBot(call_error=ValueError("Could not find the input entity"))
+    bot = FakeBot()
 
     await client.process_subscribe(event, session, bot, subscribe_args())
 
     assert "READ access" in event.responses[0]
     assert "no permission to post" in event.responses[0]
-    assert config.get_channel_subscriptions(USER_ID, SRC) == []
+    assert config.get_channel_subscriptions(USER_ID, MARKED_SRC) == []
 
 
 async def test_subscribed_channel_list_falls_back_to_per_channel_resolution(
     data_path,
 ):
-    config.create_subscription(USER_ID, SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
+    config.create_subscription(USER_ID, MARKED_SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
     src_channel = Channel(
         id=SRC,
         title="the source",
@@ -263,36 +411,44 @@ async def test_subscribed_channel_list_falls_back_to_per_channel_resolution(
         photo=ChatPhotoEmpty(),
         date=datetime(2026, 1, 1),
     )
-    calls = []
+    batch_calls = []
+    entity_calls = []
 
     class FlakyUserClient(FakeHandlerClient):
         async def __call__(self, request):
-            calls.append(request)
-            if len(calls) == 1:
-                raise ValueError("Could not find the input entity")
-            return SimpleNamespace(chats=[src_channel])
+            batch_calls.append(request)
+            raise ValueError("Could not find the input entity")
+
+        async def get_entity(self, entity_id):
+            entity_calls.append(entity_id)
+            return src_channel
 
     message_text, _, _ = await channels.build_subscribed_channel_response(
         USER_ID, FlakyUserClient(), []
     )
 
-    assert len(calls) == 2
+    assert len(batch_calls) == 1
+    assert entity_calls == [MARKED_SRC]
     assert "the source" in message_text
+    assert f"`{MARKED_SRC}`" in message_text
     assert "Unavailable" not in message_text
 
 
 async def test_subscribed_channel_list_reports_unavailable_channels(data_path):
-    config.create_subscription(USER_ID, SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
+    config.create_subscription(USER_ID, MARKED_SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
 
     class NoResolveUserClient(FakeHandlerClient):
         async def __call__(self, request):
+            raise ValueError("Could not find the input entity")
+
+        async def get_entity(self, entity_id):
             raise ValueError("Could not find the input entity")
 
     message_text, _, _ = await channels.build_subscribed_channel_response(
         USER_ID, NoResolveUserClient(), []
     )
 
-    assert f"Unavailable: {SRC}" in message_text
+    assert f"Unavailable: {MARKED_SRC}" in message_text
 
 
 def test_requeue_sync_with_progress():
@@ -351,9 +507,7 @@ async def test_sync_walk_completion_acks_command(data_path, monkeypatch):
     assert pending_dms() == []
 
 
-async def test_sync_unknown_from_token_fails_and_enqueues_dm(
-    data_path, monkeypatch
-):
+async def test_sync_unknown_from_token_fails_and_enqueues_dm(data_path, monkeypatch):
     config.create_subscription(USER_ID, SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
     cmd = {"cmd": "sync", "channel_id": SRC, "from": "bogus"}
     queue = FakeQueue([cmd])
@@ -376,9 +530,7 @@ async def test_unknown_cmd_fails_and_enqueues_dm(data_path, monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", cancel_after_sleeps(sleeps, after=1))
 
     with pytest.raises(asyncio.CancelledError):
-        await client.handle_queue_tasks(
-            USER_ID, queue, FakeUserClient(), FakeBot()
-        )
+        await client.handle_queue_tasks(USER_ID, queue, FakeUserClient(), FakeBot())
 
     assert queue.acked_failed == [cmd]
     dms = pending_dms()

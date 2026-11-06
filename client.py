@@ -16,14 +16,13 @@ from croniter import croniter
 from telethon import TelegramClient, events
 from telethon.errors import BadRequestError, RPCError
 from telethon.events import CallbackQuery, NewMessage
-from telethon.tl.functions.channels import GetChannelsRequest
-from telethon.tl.types import Chat
+from telethon.tl.types import Channel, Chat, User
 
 import config
 import notifications
 from auth import AuthManager
 from channels import build_all_channel_response, build_subscribed_channel_response
-from common import unwrap_single_chat
+from common import entity_name
 from notifications import enqueue_error_dm
 from scheduler import run_scheduled_forwardings
 from subscription import (
@@ -79,9 +78,7 @@ def requeue_sync_with_progress(
         {
             "cmd": "sync",
             "channel_id": cmd["channel_id"],
-            "from": last_processed_id
-            if last_processed_id is not None
-            else cmd["from"],
+            "from": last_processed_id if last_processed_id is not None else cmd["from"],
         }
     )
 
@@ -187,8 +184,15 @@ async def ensure_clients_consistency(
             )
 
 
-def has_send_message_permission(chat: Chat):
-    return bool(chat and chat.admin_rights and chat.admin_rights.post_messages)
+def bot_can_write(entity) -> bool:
+    if isinstance(entity, Channel) and not entity.megagroup:
+        return bool(entity.admin_rights and entity.admin_rights.post_messages)
+    if isinstance(entity, (Channel, Chat)):
+        banned = entity.default_banned_rights
+        return not (banned and banned.send_messages)
+    if isinstance(entity, User):
+        return True
+    return False
 
 
 async def process_subscribe(
@@ -202,7 +206,7 @@ async def process_subscribe(
     )
     errors = []
     try:
-        await session.user_client(GetChannelsRequest(id=[args.src_channel_id]))
+        await session.user_client.get_entity(args.src_channel_id)
     except (RPCError, ValueError) as e:
         logger.warning(
             f"User client cannot read source channel {args.src_channel_id}",
@@ -214,19 +218,17 @@ async def process_subscribe(
             f"check the id via /list."
         )
 
-    channel = None
     try:
-        channel = unwrap_single_chat(
-            await bot_client(GetChannelsRequest(id=[args.dst_channel_id]))
-        )
+        sink_entity = await bot_client.get_entity(args.dst_channel_id)
     except (RPCError, ValueError) as e:
         logger.warning(
             f"Bot cannot access sink channel {args.dst_channel_id}", exc_info=e
         )
-    if not channel or not has_send_message_permission(channel):
+        sink_entity = None
+    if not sink_entity or not bot_can_write(sink_entity):
         errors.append(
             f"Bot has no permission to post in {args.dst_channel_id}. "
-            f"Add the bot as admin with post rights and retry."
+            f"Add the bot there with post rights and retry."
         )
 
     if errors:
@@ -236,7 +238,7 @@ async def process_subscribe(
     config.create_subscription(
         event.sender_id,
         args.src_channel_id,
-        (args.dst_channel_id, channel.title),
+        (args.dst_channel_id, entity_name(sink_entity)),
         (args.filter_type, args.filter_params),
         caption=args.caption,
         schedule=args.schedule,
@@ -266,12 +268,28 @@ def cronarg(arg: str) -> str:
     return arg
 
 
+def peerarg(arg: str) -> int:
+    try:
+        peer_id = int(arg)
+    except ValueError:
+        raise ArgumentTypeError(
+            f"{arg} is not a canonical peer id: user 123456789, "
+            f"group -123456789, channel -1001234567890"
+        )
+    if peer_id == 0:
+        raise ArgumentTypeError(
+            f"{arg} is not a canonical peer id: user 123456789, "
+            f"group -123456789, channel -1001234567890"
+        )
+    return peer_id
+
+
 def syncpairarg(err_msg: str, arg: str) -> tuple[int | str, int | str]:
     k, v = tuple(arg.split("="))
-    if re.match("\\d+", k):
-        k = int(k)
-    if re.match("\\d+", v):
-        v = int(v)
+    if re.fullmatch("-?\\d+", k):
+        k = peerarg(k)
+    if re.fullmatch("-?\\d+", v):
+        v = peerarg(v)
     if not isinstance(k, int) and k != "all" or not isinstance(v, int) and v != "full":
         raise ArgumentTypeError(err_msg)
 
@@ -312,15 +330,15 @@ SUBSCRIBE_CMD = (
         "-s",
         "--src_channel_id",
         required=True,
-        type=int,
-        help="channel to listen messages from",
+        type=peerarg,
+        help="canonical id of the source peer to listen messages from: user 123456789, group -123456789, channel -1001234567890",
     ),
     parser.add_argument(
         "-d",
         "--dst_channel_id",
         required=True,
-        type=int,
-        help="channel to sink messages to",
+        type=peerarg,
+        help="canonical id of the destination peer to sink messages to: user 123456789, group -123456789, channel -1001234567890",
     ),
     parser.add_argument(
         "-f",
@@ -335,7 +353,8 @@ SUBSCRIBE_CMD = (
         "--filter_params",
         required=True,
         type=jsonarg,
-        help="params for filter. must be a valid JSON",
+        help="params for filter: single-quoted JSON, e.g. -p "
+        '\'{"min_seconds": 90, "max_seconds": 480}\'',
     ),
     parser.add_argument(
         "-c",
@@ -384,15 +403,15 @@ UNSUBSCRIBE_CMD = (
         "-s",
         "--src_channel_id",
         required=True,
-        type=int,
-        help="channel to listen messages from",
+        type=peerarg,
+        help="canonical id of the source peer to stop listening: user 123456789, group -123456789, channel -1001234567890",
     ),
     parser.add_argument(
         "-d",
         "--dst_channel_id",
         required=True,
-        type=int,
-        help="channel to sink messages to",
+        type=peerarg,
+        help="canonical id of the destination peer to stop sinking: user 123456789, group -123456789, channel -1001234567890",
     ),
     parser,
 )[-1]
@@ -425,13 +444,21 @@ CMDS = [
 ]
 
 
+TYPOGRAPHIC_CHARS = str.maketrans(
+    {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u00a0": " "}
+)
+
+
 def _parse_args(
     arg_parser: ArgumentParser, cmd_line: str
 ) -> tuple[Namespace | None, str | None]:
     try:
-        args = arg_parser.parse_args(shlex.split(cmd_line))
+        args = arg_parser.parse_args(shlex.split(cmd_line.translate(TYPOGRAPHIC_CHARS)))
         return args, None
-    except ArgumentError:
+    except ArgumentError as e:
+        logger.warning(
+            f"cannot parse {arg_parser.prog} command from {cmd_line!r}", exc_info=e
+        )
         buffer = io.StringIO()
         arg_parser.print_help(buffer)
         return None, buffer.getvalue()

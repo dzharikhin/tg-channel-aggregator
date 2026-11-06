@@ -9,7 +9,7 @@ from telethon.tl.custom import Dialog
 from telethon.tl.types import DocumentAttributeFilename
 
 import config
-from common import unwrap_single_chat
+from common import entity_name
 from subscription import Sink
 
 logger = logging.getLogger(__name__)
@@ -120,13 +120,7 @@ async def build_subscribed_channel_response(
         unavailable = []
         for channel_id, _ in subscription_slice:
             try:
-                chats_page.append(
-                    unwrap_single_chat(
-                        await user_client(
-                            functions.channels.GetChannelsRequest(id=[channel_id])
-                        )
-                    )
-                )
+                chats_page.append(await user_client.get_entity(channel_id))
             except (RPCError, ValueError):
                 unavailable.append(channel_id)
         chats_page = [chat for chat in chats_page if chat]
@@ -198,8 +192,8 @@ async def format_channel_response(
     )
     channels_formatted = "\n".join(
         [
-            f"* {channel.title}: `{channel.id}`"
-            f"{f" - subscribed to {", ".join((f"{sink.name}(`{sink.id}`>{sink.filter})" for sink in subscriptions[utils.get_peer_id(utils.get_input_peer(channel))]))}" if utils.get_peer_id(utils.get_input_peer(channel)) in subscriptions else ""}"
+            f"* {entity_name(channel)}: `{utils.get_peer_id(channel)}`"
+            f"{f" - subscribed to {", ".join((f"{sink.name}(`{sink.id}`>{sink.filter})" for sink in subscriptions[utils.get_peer_id(channel)]))}" if utils.get_peer_id(channel) in subscriptions else ""}"
             for channel in items
         ]
     )

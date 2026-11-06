@@ -6,8 +6,9 @@ from subscription import (
     unsubscribe_from_channel,
 )
 
-CHANNEL_A = 100200300
-CHANNEL_B = 400500600
+CHANNEL_M = -1000000000300  # marked channel/supergroup
+CHAT_M = -400  # marked small group
+DM_ID = 500  # user ids are their own canonical form
 
 
 class FakeClient:
@@ -36,9 +37,9 @@ class FakeClient:
         return [(callback, event) for event, callback in self._event_builders]
 
 
-def resolve(event, channel_id):
-    # telethon's _into_id_set rewrites chats to all peer-type variants
-    event.chats = {channel_id, -channel_id, -1000000000000 - channel_id}
+def resolve_positive(event, peer_id):
+    # telethon's _into_id_set rewrites positive ids to all peer-type variants
+    event.chats = {peer_id, -peer_id, -1000000000000 - peer_id}
 
 
 def channel_ids(client):
@@ -49,55 +50,67 @@ def channel_ids(client):
     return counts
 
 
-def test_subscribe_is_idempotent():
+def test_subscribe_is_idempotent_for_marked_channel():
     client = FakeClient()
-    subscribe_to_channel(1, client, CHANNEL_A, None)
-    subscribe_to_channel(1, client, CHANNEL_A, None)
-    subscribe_to_channel(1, client, CHANNEL_A, None)
-    assert channel_ids(client) == {CHANNEL_A: 1}
+    subscribe_to_channel(1, client, CHANNEL_M, None)
+    subscribe_to_channel(1, client, CHANNEL_M, None)
+    subscribe_to_channel(1, client, CHANNEL_M, None)
+    assert channel_ids(client) == {CHANNEL_M: 1}
+
+
+def test_subscribe_is_idempotent_for_marked_chat_and_dm():
+    client = FakeClient()
+    subscribe_to_channel(1, client, CHAT_M, None)
+    subscribe_to_channel(1, client, CHAT_M, None)
+    subscribe_to_channel(1, client, DM_ID, None)
+    subscribe_to_channel(1, client, DM_ID, None)
+    assert channel_ids(client) == {CHAT_M: 1, DM_ID: 1}
 
 
 def test_unsubscribe_removes_duplicates_and_keeps_other_channels():
     client = FakeClient()
-    subscribe_to_channel(1, client, CHANNEL_A, None)
+    subscribe_to_channel(1, client, CHANNEL_M, None)
     client.add_event_handler(
-        lambda e: None, events.NewMessage(chats=[CHANNEL_A])
+        lambda e: None, events.NewMessage(chats=[CHANNEL_M])
     )  # simulate a stray duplicate
-    subscribe_to_channel(1, client, CHANNEL_B, None)
+    subscribe_to_channel(1, client, CHAT_M, None)
 
-    unsubscribe_from_channel(client, CHANNEL_A)
+    unsubscribe_from_channel(client, CHANNEL_M)
 
-    assert channel_ids(client) == {CHANNEL_B: 1}
+    assert channel_ids(client) == {CHAT_M: 1}
 
 
 def test_subscribe_and_unsubscribe_work_after_resolution():
     client = FakeClient()
-    subscribe_to_channel(1, client, CHANNEL_A, None)
+    subscribe_to_channel(1, client, DM_ID, None)
     for _, event in client.list_event_handlers():
-        resolve(event, CHANNEL_A)
+        resolve_positive(event, DM_ID)
 
     # a re-subscribe must not add a second handler next to the resolved one
-    subscribe_to_channel(1, client, CHANNEL_A, None)
-    assert channel_ids(client) == {CHANNEL_A: 1}
+    subscribe_to_channel(1, client, DM_ID, None)
+    assert channel_ids(client) == {DM_ID: 1}
 
-    unsubscribe_from_channel(client, CHANNEL_A)
+    unsubscribe_from_channel(client, DM_ID)
     assert channel_ids(client) == {}
 
 
 def test_unsubscribe_unknown_channel_is_noop():
     client = FakeClient()
-    subscribe_to_channel(1, client, CHANNEL_A, None)
-    unsubscribe_from_channel(client, CHANNEL_B)
-    assert channel_ids(client) == {CHANNEL_A: 1}
+    subscribe_to_channel(1, client, CHANNEL_M, None)
+    unsubscribe_from_channel(client, CHAT_M)
+    assert channel_ids(client) == {CHANNEL_M: 1}
 
 
 def test_handler_channel_ids_variants():
-    unresolved = events.NewMessage(chats=[CHANNEL_A])
-    assert handler_channel_ids(unresolved) == {CHANNEL_A}
+    assert handler_channel_ids(events.NewMessage(chats=[CHANNEL_M])) == {CHANNEL_M}
+    assert handler_channel_ids(events.NewMessage(chats=[CHAT_M])) == {CHAT_M}
 
-    resolved = events.NewMessage(chats=[CHANNEL_A])
-    resolve(resolved, CHANNEL_A)
-    assert handler_channel_ids(resolved) == {CHANNEL_A}
+    unresolved = events.NewMessage(chats=[DM_ID])
+    assert handler_channel_ids(unresolved) == {DM_ID}
+
+    resolved = events.NewMessage(chats=[DM_ID])
+    resolve_positive(resolved, DM_ID)
+    assert handler_channel_ids(resolved) == {DM_ID}
 
     assert handler_channel_ids(events.NewMessage()) == set()
     assert handler_channel_ids("not a builder") == set()

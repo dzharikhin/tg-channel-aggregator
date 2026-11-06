@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from typing import Any, Optional, cast
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.errors import (
     ChannelPrivateError,
     ChatWriteForbiddenError,
@@ -16,7 +16,6 @@ from telethon.errors import (
     UserBannedInChannelError,
 )
 from telethon.events import NewMessage
-from telethon.tl.functions.channels import GetChannelsRequest
 from telethon.tl.types import (
     Document,
     DocumentAttributeAudio,
@@ -24,11 +23,12 @@ from telethon.tl.types import (
     Message,
     MessageEntityHashtag,
     MessageMediaPhoto,
+    PeerChannel,
 )
 
 import config
 import notifications
-from common import get_pacer, norm, unwrap_single_chat
+from common import get_pacer, norm
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.DEBUG)
@@ -118,7 +118,9 @@ def build_caption(caption_mode: str, message: Message) -> Optional[str]:
         case "none":
             return None
         case "link":
-            return f"https://t.me/c/{message.peer_id.channel_id}/{message.id}"
+            if isinstance(message.peer_id, PeerChannel):
+                return f"https://t.me/c/{message.peer_id.channel_id}/{message.id}"
+            return message.message
         case "original":
             return message.message
         case _:
@@ -307,7 +309,7 @@ def dm_text_for_failure(sink: Sink, key: str) -> str:
 async def new_message_in_target_channel_handler(
     user_id: int, bot_client: TelegramClient, event: NewMessage.Event
 ):
-    sinks_for_channel = config.get_channel_subscriptions(user_id, event.sender_id)
+    sinks_for_channel = config.get_channel_subscriptions(user_id, event.chat_id)
     await forward_to_sinks(user_id, event.message, sinks_for_channel, bot_client)
 
 
@@ -364,16 +366,16 @@ async def forward_channel_history(
     """
     last_processed_id = None
     try:
-        channel = unwrap_single_chat(
-            await user_client(GetChannelsRequest(id=[int(channel_id)]))
-        )
+        channel = await user_client.get_entity(int(channel_id))
         if not channel:
             raise ValueError(f"Channel {channel_id} is not available")
         sinks = config.get_channel_subscriptions(user_id, channel_id)
         if not sinks:
             return None
         await user_client.end_takeout(False)
-        async with user_client.takeout(channels=True) as takeout_client:
+        async with user_client.takeout(
+            channels=True, chats=True, users=True
+        ) as takeout_client:
             async for message in takeout_client.iter_messages(
                 channel, reverse=True, min_id=min_id
             ):
@@ -385,15 +387,21 @@ async def forward_channel_history(
 
 
 def handler_channel_ids(event) -> set[int]:
-    """Positive channel ids of a NewMessage builder, valid pre- and post-resolution.
+    """Canonical marked peer ids of a NewMessage builder, pre- and post-resolution.
 
-    Telethon rewrites builder ``chats`` from the originally passed ``[id]`` to
-    ``{id, -id, -100id}`` (all peer types) when the builder gets resolved, so
-    keep the positive ids only - those are what subscription config stores.
+    Positive ids (users) are rewritten by telethon on resolution into all
+    peer-type variants; keep the original positive id and drop the artifacts.
+    Negative (marked chat/channel) ids are kept as-is - those are what
+    subscription config stores.
     """
     if not isinstance(event, events.NewMessage) or event.chats is None:
         return set()
-    return {chat for chat in event.chats if isinstance(chat, int) and chat > 0}
+    ids = {chat for chat in event.chats if isinstance(chat, int)}
+    result = {chat for chat in ids if chat > 0}
+    result |= {
+        chat for chat in ids if chat < 0 and utils.resolve_id(chat)[0] not in result
+    }
+    return result
 
 
 def subscribe_to_channel(

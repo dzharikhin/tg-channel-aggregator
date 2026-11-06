@@ -4,12 +4,10 @@ from datetime import datetime
 
 from croniter import croniter
 from telethon import TelegramClient
-from telethon.tl.functions.channels import GetChannelsRequest
 
 import config
 import notifications
 from auth import AuthManager
-from common import unwrap_single_chat
 from subscription import (
     Outcome,
     Sink,
@@ -42,9 +40,7 @@ async def forward_step(
     sink: Sink,
     now: datetime,
 ):
-    channel = unwrap_single_chat(
-        await user_client(GetChannelsRequest(id=[source_channel_id]))
-    )
+    channel = await user_client.get_entity(source_channel_id)
     if not channel:
         raise ValueError(f"Channel {source_channel_id} is not available")
 

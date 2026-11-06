@@ -1,5 +1,6 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from fakes import (
@@ -16,6 +17,7 @@ from fakes import (
     text_message,
 )
 from telethon.errors import ChatWriteForbiddenError, FloodWaitError, RPCError
+from telethon.tl.types import PeerChat, PeerUser
 
 import common
 import config
@@ -23,10 +25,14 @@ from subscription import (
     ChannelHistoryError,
     Outcome,
     Sink,
+    build_caption,
     deliver_to_sink,
     forward_channel_history,
     forward_to_sinks,
+    new_message_in_target_channel_handler,
 )
+
+MARKED_SRC = -1000000000100
 
 
 def make_sink(sink_id=DST, caption="link"):
@@ -152,9 +158,7 @@ async def test_forward_channel_history_returns_last_processed_id(data_path):
     user_client = FakeUserClient([mp3_message(1), photo_message(2), mp3_message(3)])
     bot = FakeBot()
 
-    last_id = await forward_channel_history(
-        USER_ID, user_client, bot, SRC, min_id=0
-    )
+    last_id = await forward_channel_history(USER_ID, user_client, bot, SRC, min_id=0)
 
     assert last_id == 3
     assert len(bot.sent_files) == 2
@@ -182,7 +186,9 @@ async def test_forward_channel_history_without_sinks_returns_none(data_path):
 
 
 async def test_forward_channel_history_unavailable_channel_raises():
-    user_client = FakeUserClient(chats=[])
+    user_client = FakeUserClient(
+        get_entity_error=ValueError("Could not find the input entity")
+    )
     with pytest.raises(ValueError):
         await forward_channel_history(USER_ID, user_client, FakeBot(), SRC)
 
@@ -200,3 +206,40 @@ async def test_forward_channel_history_failure_carries_progress(data_path):
 
     assert exc_info.value.last_processed_id == 1
     assert isinstance(exc_info.value.cause, RPCError)
+
+
+def test_link_caption_keeps_tme_link_for_channel_messages():
+    message = mp3_message(5)
+    assert build_caption("link", message) == f"https://t.me/c/{SRC}/{message.id}"
+
+
+def test_link_caption_falls_back_to_original_text_for_chat_messages():
+    message = text_message(5, "hello")
+    message.peer_id = PeerChat(456)
+    assert build_caption("link", message) == "hello"
+
+
+def test_link_caption_falls_back_to_original_text_for_dm_messages():
+    message = text_message(5, "hello")
+    message.peer_id = PeerUser(88)
+    assert build_caption("link", message) == "hello"
+
+
+async def test_realtime_handler_uses_marked_chat_id(data_path):
+    config.create_subscription(USER_ID, MARKED_SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
+    bot = FakeBot()
+    event = SimpleNamespace(chat_id=MARKED_SRC, message=mp3_message(1))
+
+    await new_message_in_target_channel_handler(USER_ID, bot, event)
+
+    assert len(bot.sent_files) == 1
+
+
+async def test_realtime_handler_ignores_non_canonical_chat_id_spelling(data_path):
+    config.create_subscription(USER_ID, MARKED_SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
+    bot = FakeBot()
+    event = SimpleNamespace(chat_id=SRC, message=mp3_message(1))
+
+    await new_message_in_target_channel_handler(USER_ID, bot, event)
+
+    assert bot.sent_files == []

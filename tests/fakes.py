@@ -83,9 +83,19 @@ def pending_dms() -> list:
 class FakeBot:
     """Fake bot client for the delivery pipeline, DM processor and commands."""
 
-    def __init__(self, history=(), chats=None, call_error=None, call_times=None):
+    def __init__(
+        self,
+        history=(),
+        chats=None,
+        entities=None,
+        get_entity_error=None,
+        call_error=None,
+        call_times=None,
+    ):
         self.history = list(history)
         self.chats = chats
+        self.entities = entities or {}
+        self.get_entity_error = get_entity_error
         self.call_error = call_error
         self.call_times = call_times
         self.sent_files = []  # (sink_id, media, caption)
@@ -105,6 +115,14 @@ class FakeBot:
         if self.call_error is not None:
             raise self.call_error
         return SimpleNamespace(chats=self.chats)
+
+    async def get_entity(self, entity_id):
+        self._track_call()
+        if self.get_entity_error is not None:
+            raise self.get_entity_error
+        if entity_id in self.entities:
+            return self.entities[entity_id]
+        raise ValueError(f"Could not find the input entity for {entity_id}")
 
     async def send_file(self, sink_id, media, caption=None):
         self._track_call()
@@ -133,15 +151,28 @@ class FakeBot:
 class FakeUserClient:
     """Fake user client: listens to sources, never sends."""
 
-    def __init__(self, messages=(), fail_after=None, fail_with=None, chats=None):
+    def __init__(
+        self,
+        messages=(),
+        fail_after=None,
+        fail_with=None,
+        chats=None,
+        get_entity_error=None,
+    ):
         self.messages = sorted(messages, key=lambda m: m.id)
         self.fail_after = fail_after
         self.fail_with = fail_with
         self.chats = chats
+        self.get_entity_error = get_entity_error
 
     async def __call__(self, request):
         chats = self.chats if self.chats is not None else [SimpleNamespace(id=SRC)]
         return SimpleNamespace(chats=chats)
+
+    async def get_entity(self, entity):
+        if self.get_entity_error is not None:
+            raise self.get_entity_error
+        return SimpleNamespace(id=entity)
 
     async def get_messages(self, entity, limit=1):
         return self.messages[-limit:] if self.messages else []
@@ -162,7 +193,7 @@ class FakeUserClient:
     async def end_takeout(self, success):
         pass
 
-    def takeout(self, channels=True):
+    def takeout(self, channels=True, chats=True, users=True):
         return self
 
     async def __aenter__(self):
@@ -204,15 +235,23 @@ class FakeQueue:
 class FakeHandlerClient:
     """Minimal user client with telethon's handler-registry no-op semantics."""
 
-    def __init__(self, chats=None, call_error=None):
+    def __init__(self, chats=None, call_error=None, entities=None):
         self._handlers = []
         self.chats = chats if chats is not None else [SimpleNamespace(id=SRC)]
         self.call_error = call_error
+        self.entities = entities if entities is not None else {}
 
     async def __call__(self, request):
         if self.call_error is not None:
             raise self.call_error
         return SimpleNamespace(chats=self.chats)
+
+    async def get_entity(self, entity_id):
+        if self.call_error is not None:
+            raise self.call_error
+        if entity_id in self.entities:
+            return self.entities[entity_id]
+        raise ValueError(f"Could not find the input entity for {entity_id}")
 
     def add_event_handler(self, callback, event=None):
         self._handlers.append((callback, event))
