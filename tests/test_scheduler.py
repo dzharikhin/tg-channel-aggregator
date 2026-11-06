@@ -6,7 +6,6 @@ from fakes import (
     MP3_PARAMS,
     SRC,
     USER_ID,
-    FakeBot,
     FakeUserClient,
     mp3_message,
     pending_dms,
@@ -68,11 +67,10 @@ def test_is_due_false_before_next_occurrence():
 async def test_first_run_without_start_skips_whole_history(data_path):
     sink = make_scheduled_sink(data_path)
     user_client = FakeUserClient([mp3_message(1), mp3_message(2)])
-    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
-    assert bot.sent_files == []
+    assert user_client.sent_files == []
     state = read_state(data_path)
     assert state["last_forwarded_message_id"] == 2
     assert state["last_run_at"] == NOW.isoformat()
@@ -81,12 +79,11 @@ async def test_first_run_without_start_skips_whole_history(data_path):
 async def test_start_message_id_defines_first_candidates(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=1)
     user_client = FakeUserClient([mp3_message(1), mp3_message(2), mp3_message(3)])
-    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
     # default batch is 1: only the next matching message is forwarded
-    assert len(bot.sent_files) == 1
+    assert len(user_client.sent_files) == 1
     assert read_state(data_path)["last_forwarded_message_id"] == 2
 
 
@@ -95,11 +92,10 @@ async def test_batch_forwards_several_messages_per_run(data_path):
     user_client = FakeUserClient(
         [mp3_message(1), mp3_message(2), mp3_message(3), mp3_message(4)]
     )
-    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
-    assert len(bot.sent_files) == 2
+    assert len(user_client.sent_files) == 2
     assert read_state(data_path)["last_forwarded_message_id"] == 3
     # 4th message stays for the next run
 
@@ -107,23 +103,21 @@ async def test_batch_forwards_several_messages_per_run(data_path):
 async def test_next_run_resumes_after_drip_feed_pointer(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=1)
     user_client = FakeUserClient([mp3_message(1), mp3_message(2), mp3_message(3)])
-    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
     sink = config.get_channel_subscriptions(USER_ID, SRC)[0]
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
-    assert len(bot.sent_files) == 2
+    assert len(user_client.sent_files) == 2
 
 
 async def test_non_matching_tail_is_skipped_not_rescanned(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=0)
     user_client = FakeUserClient([mp3_message(1), photo_message(2), photo_message(3)])
-    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
-    assert len(bot.sent_files) == 1
+    assert len(user_client.sent_files) == 1
     # history exhausted: pointer moves to the newest examined message
     assert read_state(data_path)["last_forwarded_message_id"] == 3
 
@@ -131,13 +125,12 @@ async def test_non_matching_tail_is_skipped_not_rescanned(data_path):
 async def test_send_failure_advances_pointer_enqueues_dm_and_continues(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=0, batch=2)
     user_client = FakeUserClient([photo_message(1), mp3_message(2), mp3_message(3)])
-    bot = FakeBot()
-    bot.file_errors = [RuntimeError("boom")]
+    user_client.file_errors = [RuntimeError("boom")]
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
     # message 2 failed permanently, message 3 was still processed
-    assert len(bot.sent_files) == 1
+    assert len(user_client.sent_files) == 1
     state = read_state(data_path)
     assert state["last_forwarded_message_id"] == 3
     # the run counts as done: no retry of the failed message
@@ -149,12 +142,11 @@ async def test_send_failure_advances_pointer_enqueues_dm_and_continues(data_path
 async def test_permission_failure_stops_step_and_enqueues_dm(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=0, batch=2)
     user_client = FakeUserClient([photo_message(1), mp3_message(2), mp3_message(3)])
-    bot = FakeBot()
-    bot.file_errors = [ChatWriteForbiddenError(None)]
+    user_client.file_errors = [ChatWriteForbiddenError(None)]
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
-    assert bot.sent_files == []
+    assert user_client.sent_files == []
     state = read_state(data_path)
     # pointer advances PAST the failed message, but the step stops
     assert state["last_forwarded_message_id"] == 2
@@ -174,36 +166,23 @@ async def test_dedup_skip_advances_pointer_without_dm(data_path):
         ],
         sink_history=[sink_message(7, media=duplicated.media)],
     )
-    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
     # only the duplicated middle message is suppressed
-    assert len(bot.sent_files) == 2
+    assert len(user_client.sent_files) == 2
     state = read_state(data_path)
     assert state["last_forwarded_message_id"] == 3
     assert pending_dms() == []
 
 
-async def test_user_via_scheduled_step_sends_with_user_client(data_path):
-    sink = make_scheduled_sink(data_path, start_message_id=1, via="user")
-    user_client = FakeUserClient([mp3_message(1), mp3_message(2)])
-    bot = FakeBot()
-
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
-
-    assert len(user_client.sent_files) == 1
-    assert bot.sent_files == []
-
-
 async def test_no_new_messages_is_a_noop(data_path):
     sink = make_scheduled_sink(data_path, start_message_id=3)
     user_client = FakeUserClient([mp3_message(1), mp3_message(2), mp3_message(3)])
-    bot = FakeBot()
 
-    await scheduler.forward_step(USER_ID, user_client, bot, SRC, sink, NOW)
+    await scheduler.forward_step(USER_ID, user_client, SRC, sink, NOW)
 
-    assert bot.sent_files == []
+    assert user_client.sent_files == []
     state = read_state(data_path)
     assert state["last_forwarded_message_id"] == 3
     assert state["last_run_at"] == NOW.isoformat()
@@ -229,13 +208,11 @@ async def test_forward_to_sinks_skips_scheduled_sinks():
             }
         ),
     )
-    bot = FakeBot()
+    user_client = FakeUserClient()
 
-    await forward_to_sinks(
-        USER_ID, FakeUserClient(), mp3_message(5), [scheduled, realtime], bot
-    )
+    await forward_to_sinks(USER_ID, user_client, mp3_message(5), [scheduled, realtime])
 
-    assert [sink_id for sink_id, _, _ in bot.sent_files] == [DST + 1]
+    assert [sink_id for sink_id, _, _ in user_client.sent_files] == [DST + 1]
 
 
 def test_create_subscription_writes_schedule_and_anchor(data_path):

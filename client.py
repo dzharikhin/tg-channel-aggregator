@@ -27,7 +27,6 @@ from notifications import enqueue_error_dm
 from scheduler import run_scheduled_forwardings
 from subscription import (
     CAPTION_MODES,
-    SEND_VIA_MODES,
     ChannelHistoryError,
     forward_channel_history,
     handler_channel_ids,
@@ -50,14 +49,10 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.DEBUG)
 
 
-async def check_clients_consistency(
-    auth_manager: AuthManager,
-    tasks: dict[str, Task],
-    bot_client: TelegramClient,
-):
+async def check_clients_consistency(auth_manager: AuthManager, tasks: dict[str, Task]):
     while True:
         try:
-            await ensure_clients_consistency(auth_manager, tasks, bot_client)
+            await ensure_clients_consistency(auth_manager, tasks)
         except RPCError as e:
             logger.warning(
                 "Exception on consistency check, continue",
@@ -88,7 +83,6 @@ async def handle_queue_tasks(
     user_id: int,
     queue: persistqueue.SQLiteAckQueue,
     user_client: TelegramClient,
-    bot_client: TelegramClient,
 ):
     while True:
         cmd = None
@@ -105,7 +99,6 @@ async def handle_queue_tasks(
                 await forward_channel_history(
                     user_id,
                     user_client,
-                    bot_client,
                     cmd["channel_id"],
                     min_id,
                 )
@@ -144,7 +137,6 @@ async def handle_queue_tasks(
 async def ensure_clients_consistency(
     auth_manager: AuthManager,
     tasks: dict[str, Task],
-    bot_client: TelegramClient,
     reinit_handlers: bool = False,
 ):
     for user_id in auth_manager.tracked_users():
@@ -170,10 +162,10 @@ async def ensure_clients_consistency(
                 )
                 unsubscribe_from_channel(user_client, channel_id)
                 if channel_id in channels_to_listen:
-                    subscribe_to_channel(user_id, user_client, channel_id, bot_client)
+                    subscribe_to_channel(user_id, user_client, channel_id)
         actual_subscribed_channels = set(channel_handler_counts)
         for to_add in channels_to_listen - actual_subscribed_channels:
-            subscribe_to_channel(user_id, user_client, to_add, bot_client)
+            subscribe_to_channel(user_id, user_client, to_add)
         for to_remove in actual_subscribed_channels - channels_to_listen:
             unsubscribe_from_channel(user_client, to_remove)
 
@@ -181,11 +173,11 @@ async def ensure_clients_consistency(
         current_task = tasks.get(handle_task_id)
         if not current_task or current_task.done() or current_task.cancelled():
             tasks[handle_task_id] = asyncio.create_task(
-                handle_queue_tasks(user_id, session.queue, user_client, bot_client),
+                handle_queue_tasks(user_id, session.queue, user_client),
             )
 
 
-def bot_can_write(entity) -> bool:
+def can_write(entity) -> bool:
     if isinstance(entity, Channel) and not entity.megagroup:
         return bool(entity.admin_rights and entity.admin_rights.post_messages)
     if isinstance(entity, (Channel, Chat)):
@@ -199,7 +191,6 @@ def bot_can_write(entity) -> bool:
 async def process_subscribe(
     event: NewMessage.Event,
     session,
-    bot_client: TelegramClient,
     args: Namespace,
 ):
     logger.debug(
@@ -219,11 +210,13 @@ async def process_subscribe(
             f"check the id via /list."
         )
 
+    sink_entity = None
     try:
-        await session.user_client.get_entity(args.dst_channel_id)
+        sink_entity = await session.user_client.get_entity(args.dst_channel_id)
     except (RPCError, ValueError) as e:
         logger.warning(
-            f"User client cannot read sink channel {args.dst_channel_id} " f"for dedup",
+            f"User client cannot access sink channel {args.dst_channel_id} "
+            f"for dedup",
             exc_info=e,
         )
         errors.append(
@@ -231,18 +224,10 @@ async def process_subscribe(
             f"{args.dst_channel_id}. Duplicate checks read its history via "
             f"your account; join the channel and retry."
         )
-
-    try:
-        sink_entity = await bot_client.get_entity(args.dst_channel_id)
-    except (RPCError, ValueError) as e:
-        logger.warning(
-            f"Bot cannot access sink channel {args.dst_channel_id}", exc_info=e
-        )
-        sink_entity = None
-    if not sink_entity or not bot_can_write(sink_entity):
+    if sink_entity is not None and not can_write(sink_entity):
         errors.append(
-            f"Bot has no permission to post in {args.dst_channel_id}. "
-            f"Add the bot there with post rights and retry."
+            f"Your account has no permission to post in {args.dst_channel_id}. "
+            f"Make sure your account can post messages there and retry."
         )
 
     if errors:
@@ -255,14 +240,11 @@ async def process_subscribe(
         (args.dst_channel_id, entity_name(sink_entity)),
         (args.filter_type, args.filter_params),
         caption=args.caption,
-        via=args.via,
         schedule=args.schedule,
         start_message_id=args.start_message_id,
         batch=args.batch,
     )
-    subscribe_to_channel(
-        event.sender_id, session.user_client, args.src_channel_id, bot_client
-    )
+    subscribe_to_channel(event.sender_id, session.user_client, args.src_channel_id)
     await event.respond(
         f"subscribed {args.src_channel_id} -> {args.dst_channel_id}"
         + (f" on schedule {args.schedule!r}" if args.schedule else "")
@@ -381,15 +363,6 @@ SUBSCRIBE_CMD = (
         help="caption for forwarded media: none - no caption, link - link to original message (default), original - original message text",
     ),
     parser.add_argument(
-        "-v",
-        "--via",
-        required=False,
-        type=str,
-        choices=sorted(SEND_VIA_MODES),
-        default="bot",
-        help="account that sends messages to the sink: bot (default) or user - your own account",
-    ),
-    parser.add_argument(
         "-r",
         "--schedule",
         required=False,
@@ -494,6 +467,10 @@ def _not_matched_command(txt: str) -> bool:
 
 def _filter_not_mapped(event: NewMessage.Event) -> bool:
     return not event.is_channel and _not_matched_command(event.message.message or "")
+
+
+def _private_only(event: NewMessage.Event) -> bool:
+    return event.is_private
 
 
 def build_help() -> str:
@@ -651,7 +628,7 @@ async def main():
                 await event.respond(help_to_print)
                 return
 
-            await process_subscribe(event, session, bot_client, args)
+            await process_subscribe(event, session, args)
 
         @bot_client.on(events.NewMessage(incoming=True, pattern=UNSUBSCRIBE_CMD.epilog))
         @report_errors
@@ -702,17 +679,19 @@ async def main():
                     {"cmd": "sync", "channel_id": channel_id, "from": offset}
                 )
 
-        @bot_client.on(events.NewMessage(incoming=True, pattern="^[^/].+"))
+        @bot_client.on(
+            events.NewMessage(incoming=True, pattern="^[^/].+", func=_private_only)
+        )
         @report_errors
         async def common_message_handler(event: NewMessage.Event):
             await auth_manager.feed_message(event.sender_id, event)
 
-        await ensure_clients_consistency(auth_manager, tasks, bot_client, True)
+        await ensure_clients_consistency(auth_manager, tasks, True)
         tasks["check_clients_consistency"] = asyncio.create_task(
-            check_clients_consistency(auth_manager, tasks, bot_client)
+            check_clients_consistency(auth_manager, tasks)
         )
         tasks["scheduled_forwarding"] = asyncio.create_task(
-            run_scheduled_forwardings(auth_manager, bot_client)
+            run_scheduled_forwardings(auth_manager)
         )
         tasks["dm_processor"] = asyncio.create_task(
             notifications.run_dm_processor(bot_client)

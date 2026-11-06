@@ -35,7 +35,6 @@ def sink_last_run_at(sink: Sink) -> datetime | None:
 async def forward_step(
     user_id: int,
     user_client: TelegramClient,
-    bot_client: TelegramClient,
     source_channel_id: int,
     sink: Sink,
     now: datetime,
@@ -67,7 +66,7 @@ async def forward_step(
             # batch is full: leave the rest, starting from this message,
             # for the next scheduled run
             break
-        result = await deliver_to_sink(user_id, user_client, bot_client, sink, message)
+        result = await deliver_to_sink(user_id, user_client, sink, message)
         # the pointer advances past EVERY examined message, failed ones
         # included: failed sends are not retried
         state["last_forwarded_message_id"] = message.id
@@ -88,10 +87,7 @@ async def forward_step(
     )
 
 
-async def run_scheduled_forwardings(
-    auth_manager: AuthManager,
-    bot_client: TelegramClient,
-):
+async def run_scheduled_forwardings(auth_manager: AuthManager):
     while True:
         try:
             now = datetime.now()
@@ -114,7 +110,6 @@ async def run_scheduled_forwardings(
                             await forward_step(
                                 user_id,
                                 session.user_client,
-                                bot_client,
                                 source_channel_id,
                                 sink,
                                 now,

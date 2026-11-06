@@ -395,6 +395,8 @@ class AuthManager:
             return self._machines[user_id]
 
     async def _check_access(self, user_id: int) -> bool:
+        if user_id <= 0:
+            return False
         if config.is_allowed_user(user_id):
             return True
         user = await self._bot_client.get_entity(user_id)

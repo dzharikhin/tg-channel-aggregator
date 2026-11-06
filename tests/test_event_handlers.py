@@ -52,28 +52,28 @@ def channel_ids(client):
 
 def test_subscribe_is_idempotent_for_marked_channel():
     client = FakeClient()
-    subscribe_to_channel(1, client, CHANNEL_M, None)
-    subscribe_to_channel(1, client, CHANNEL_M, None)
-    subscribe_to_channel(1, client, CHANNEL_M, None)
+    subscribe_to_channel(1, client, CHANNEL_M)
+    subscribe_to_channel(1, client, CHANNEL_M)
+    subscribe_to_channel(1, client, CHANNEL_M)
     assert channel_ids(client) == {CHANNEL_M: 1}
 
 
 def test_subscribe_is_idempotent_for_marked_chat_and_dm():
     client = FakeClient()
-    subscribe_to_channel(1, client, CHAT_M, None)
-    subscribe_to_channel(1, client, CHAT_M, None)
-    subscribe_to_channel(1, client, DM_ID, None)
-    subscribe_to_channel(1, client, DM_ID, None)
+    subscribe_to_channel(1, client, CHAT_M)
+    subscribe_to_channel(1, client, CHAT_M)
+    subscribe_to_channel(1, client, DM_ID)
+    subscribe_to_channel(1, client, DM_ID)
     assert channel_ids(client) == {CHAT_M: 1, DM_ID: 1}
 
 
 def test_unsubscribe_removes_duplicates_and_keeps_other_channels():
     client = FakeClient()
-    subscribe_to_channel(1, client, CHANNEL_M, None)
+    subscribe_to_channel(1, client, CHANNEL_M)
     client.add_event_handler(
         lambda e: None, events.NewMessage(chats=[CHANNEL_M])
     )  # simulate a stray duplicate
-    subscribe_to_channel(1, client, CHAT_M, None)
+    subscribe_to_channel(1, client, CHAT_M)
 
     unsubscribe_from_channel(client, CHANNEL_M)
 
@@ -82,12 +82,12 @@ def test_unsubscribe_removes_duplicates_and_keeps_other_channels():
 
 def test_subscribe_and_unsubscribe_work_after_resolution():
     client = FakeClient()
-    subscribe_to_channel(1, client, DM_ID, None)
+    subscribe_to_channel(1, client, DM_ID)
     for _, event in client.list_event_handlers():
         resolve_positive(event, DM_ID)
 
     # a re-subscribe must not add a second handler next to the resolved one
-    subscribe_to_channel(1, client, DM_ID, None)
+    subscribe_to_channel(1, client, DM_ID)
     assert channel_ids(client) == {DM_ID: 1}
 
     unsubscribe_from_channel(client, DM_ID)
@@ -96,7 +96,7 @@ def test_subscribe_and_unsubscribe_work_after_resolution():
 
 def test_unsubscribe_unknown_channel_is_noop():
     client = FakeClient()
-    subscribe_to_channel(1, client, CHANNEL_M, None)
+    subscribe_to_channel(1, client, CHANNEL_M)
     unsubscribe_from_channel(client, CHAT_M)
     assert channel_ids(client) == {CHANNEL_M: 1}
 

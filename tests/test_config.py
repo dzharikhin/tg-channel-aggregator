@@ -60,27 +60,17 @@ def test_get_all_user_subscriptions_survives_corrupt_file(data_path):
     assert [sink.id for sink in subscriptions[0][1]] == [DST]
 
 
-def test_create_subscription_persists_via(data_path):
-    config.create_subscription(
-        USER_ID, SRC, (DST, "sink"), ("mp3", MP3_PARAMS), via="user"
-    )
-    raw = json.loads(sink_file_path(data_path).read_text())
-    assert raw["via"] == "user"
-    assert config.get_channel_subscriptions(USER_ID, SRC)[0].via == "user"
-
-
-def test_create_subscription_without_via_omits_key(data_path):
+def test_create_subscription_writes_no_via_key(data_path):
     config.create_subscription(USER_ID, SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
     raw = json.loads(sink_file_path(data_path).read_text())
     assert "via" not in raw
-    assert config.get_channel_subscriptions(USER_ID, SRC)[0].via == "bot"
 
 
-def test_unknown_via_makes_sink_config_corrupt(data_path, caplog):
+def test_stale_via_key_in_sink_config_is_ignored(data_path):
     config.create_subscription(USER_ID, SRC, (DST, "sink"), ("mp3", MP3_PARAMS))
     raw = json.loads(sink_file_path(data_path).read_text())
-    raw["via"] = "carrier_pigeon"
-    sink_file_path(data_path).write_text(json.dumps(raw))
-    with caplog.at_level(logging.WARNING):
+    for stale_via in ("bot", "user"):
+        raw["via"] = stale_via
+        sink_file_path(data_path).write_text(json.dumps(raw))
         sinks = config.get_channel_subscriptions(USER_ID, SRC)
-    assert sinks == []
+        assert [sink.id for sink in sinks] == [DST]

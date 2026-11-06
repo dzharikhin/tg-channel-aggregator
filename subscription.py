@@ -35,8 +35,6 @@ logger.setLevel(logging.DEBUG)
 
 CAPTION_MODES = {"none", "link", "original"}
 
-SEND_VIA_MODES = {"bot", "user"}
-
 
 class Filter:
     def filter_message(self, message) -> bool:
@@ -141,11 +139,6 @@ class Sink(Filter):
                 f"Unknown caption mode {self.caption} for sink {self.id}, must be one of {sorted(CAPTION_MODES)}"
             )
         self.filter = Filter.get_filter(**sink_cfg["filter"])
-        self.via = sink_cfg.get("via", "bot")
-        if self.via not in SEND_VIA_MODES:
-            raise ValueError(
-                f"Unknown send mode {self.via} for sink {self.id}, must be one of {sorted(SEND_VIA_MODES)}"
-            )
         self.schedule = sink_cfg.get("schedule")
         self.start_message_id = sink_cfg.get("start_message_id")
         self.batch = sink_cfg.get("batch", 1)
@@ -155,7 +148,7 @@ class Sink(Filter):
         return self.filter.filter_message(message)
 
     def __repr__(self):
-        return f"Sink[id={self.id}, name={self.name}, via={self.via}, filter={self.filter}]"
+        return f"Sink[id={self.id}, name={self.name}, filter={self.filter}]"
 
 
 class Outcome(str, enum.Enum):
@@ -234,7 +227,6 @@ async def _sink_recently_received(
 async def deliver_to_sink(
     user_id: int,
     user_client: TelegramClient,
-    bot_client: TelegramClient,
     sink: Sink,
     message: Message,
 ) -> DeliveryResult:
@@ -252,16 +244,15 @@ async def deliver_to_sink(
             f"Message {message.id} for user {user_id} is already in {sink}, skipping"
         )
         return DeliveryResult(Outcome.SKIPPED_DUPLICATE)
-    sender = user_client if "user" == sink.via else bot_client
     for attempt in (1, 2):
         try:
             await get_pacer().wait()
-            await sender.send_file(
+            await user_client.send_file(
                 sink.id,
                 message.media,
                 caption=build_caption(sink.caption, message),
             )
-            logger.debug(f"Forwarded message {message.id} to {sink} via {sink.via}")
+            logger.debug(f"Forwarded message {message.id} to {sink} with user client")
             return DeliveryResult(Outcome.SENT)
         except FloodWaitError as e:
             if attempt == 2:
@@ -292,9 +283,8 @@ async def deliver_to_sink(
 def dm_text_for_failure(sink: Sink, key: str) -> str:
     kind, _, rest = key.partition(":")
     if "send-perm" == kind:
-        who = "Your account" if "user" == sink.via else "Bot"
         return (
-            f"{who} has no permission to send messages in {sink.name}({sink.id}). "
+            f"Your account has no permission to send messages in {sink.name}({sink.id}). "
             f"Grant post rights or /unsubscribe."
         )
     if "send-flood" == kind:
@@ -319,13 +309,10 @@ def dm_text_for_failure(sink: Sink, key: str) -> str:
 async def new_message_in_target_channel_handler(
     user_id: int,
     user_client: TelegramClient,
-    bot_client: TelegramClient,
     event: NewMessage.Event,
 ):
     sinks_for_channel = config.get_channel_subscriptions(user_id, event.chat_id)
-    await forward_to_sinks(
-        user_id, user_client, event.message, sinks_for_channel, bot_client
-    )
+    await forward_to_sinks(user_id, user_client, event.message, sinks_for_channel)
 
 
 async def forward_to_sinks(
@@ -333,7 +320,6 @@ async def forward_to_sinks(
     user_client: TelegramClient,
     message: Message,
     sinks_for_channel,
-    bot_client: TelegramClient,
 ):
     for sink in sinks_for_channel:
         try:
@@ -347,9 +333,7 @@ async def forward_to_sinks(
                     f"For user {user_id} message {message.id} did not match for sink {sink}, skipping"
                 )
                 continue
-            result = await deliver_to_sink(
-                user_id, user_client, bot_client, sink, message
-            )
+            result = await deliver_to_sink(user_id, user_client, sink, message)
             if result.outcome == Outcome.FAILED and result.key:
                 notifications.enqueue_error_dm(
                     user_id, result.key, dm_text_for_failure(sink, result.key)
@@ -372,7 +356,6 @@ class ChannelHistoryError(Exception):
 async def forward_channel_history(
     user_id: int,
     user_client: TelegramClient,
-    bot_client: TelegramClient,
     channel_id: int,
     min_id: int | None = None,
 ) -> Optional[int]:
@@ -398,7 +381,7 @@ async def forward_channel_history(
                 channel, reverse=True, min_id=min_id
             ):
                 last_processed_id = message.id
-                await forward_to_sinks(user_id, user_client, message, sinks, bot_client)
+                await forward_to_sinks(user_id, user_client, message, sinks)
     except RPCError as e:
         raise ChannelHistoryError(last_processed_id, e) from e
     return last_processed_id
@@ -426,7 +409,6 @@ def subscribe_to_channel(
     user_id: int,
     user_client: TelegramClient,
     source_channel_id: int,
-    bot_client: TelegramClient,
 ):
     channel_id = int(source_channel_id)
     already_subscribed = any(
@@ -437,9 +419,7 @@ def subscribe_to_channel(
         logger.debug(f"Handler for channel {channel_id} already exists, skipping")
         return
     user_client.add_event_handler(
-        partial(
-            new_message_in_target_channel_handler, user_id, user_client, bot_client
-        ),
+        partial(new_message_in_target_channel_handler, user_id, user_client),
         event=events.NewMessage(chats=[channel_id]),
     )
 

@@ -69,6 +69,14 @@ async def test_denied_user_gets_owner_notification_only(manager, bot):
     assert 555 not in manager.tracked_users()
 
 
+async def test_channel_peer_id_is_denied_silently(manager, bot):
+    channel_id = -1002439736204
+    assert await manager.ensure_authorized(channel_id) is None
+    assert await manager.feed_message(channel_id, AuthEvent(1, "text")) is None
+    assert bot.sent == []
+    assert channel_id not in manager.tracked_users()
+
+
 async def test_ensure_authorized_returns_session_when_client_has_valid_session(
     manager, bot, monkeypatch
 ):
