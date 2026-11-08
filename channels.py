@@ -4,10 +4,11 @@ import logging
 from typing import Literal, Optional
 
 from telethon import Button, TelegramClient, functions, utils
-from telethon.tl.custom import Dialog
+from telethon.errors import RPCError
 from telethon.tl.types import DocumentAttributeFilename
 
 import config
+from common import entity_name
 from subscription import Sink
 
 logger = logging.getLogger(__name__)
@@ -18,9 +19,10 @@ async def get_all_channels_page(
     user_client: TelegramClient,
     offset_stack: list[float],
     action: Optional[tuple[float, Literal["backward", "forward"]]],
-) -> tuple[list[Dialog], list[float | None], Optional[float], Optional[float]]:
+) -> tuple[list[object], list[float | None], Optional[float], Optional[float]]:
     target_offset, action_type = action if action else (None, None)
     channels = []
+    last_dialog_date = None
     async for dialog in user_client.iter_dialogs(
         archived=False,
         ignore_migrated=True,
@@ -32,8 +34,9 @@ async def get_all_channels_page(
     ):
         if dialog.is_channel and not dialog.is_group and not dialog.is_user:
             channels.append(
-                dialog
-            )  # dialog.entity.admin_rights.post_messages = True to get sinkable
+                dialog.entity
+            )  # entity.admin_rights.post_messages = True to get sinkable
+            last_dialog_date = dialog.date
         if len(channels) >= config.dialog_list_page_size:
             break
 
@@ -41,7 +44,7 @@ async def get_all_channels_page(
         previous_offset = None
         offset_stack.append(-1)
         next_offset = (
-            channels[-1].date.timestamp()
+            last_dialog_date.timestamp()
             if len(channels) >= config.dialog_list_page_size
             else None
         )
@@ -49,14 +52,14 @@ async def get_all_channels_page(
         previous_offset = offset_stack[-1] if offset_stack else None
         offset_stack.append(target_offset)
         next_offset = (
-            channels[-1].date.timestamp()
+            last_dialog_date.timestamp()
             if len(channels) >= config.dialog_list_page_size
             else None
         )
     elif "backward" == action_type:
         offset_stack.pop()
         next_offset = (
-            channels[-1].date.timestamp()
+            last_dialog_date.timestamp()
             if len(channels) >= config.dialog_list_page_size
             else None
         )
@@ -99,9 +102,29 @@ async def build_subscribed_channel_response(
     subscription_slice = subscriptions[
         target_offset : target_offset + config.dialog_list_page_size
     ]
-    subscriptions_page = await user_client(
-        functions.channels.GetChannelsRequest(id=[s for s, _ in subscription_slice])
-    )
+    try:
+        chats_page = (
+            await user_client(
+                functions.channels.GetChannelsRequest(
+                    id=[s for s, _ in subscription_slice]
+                )
+            )
+        ).chats
+        unavailable = []
+    except (RPCError, ValueError) as e:
+        logger.warning(
+            f"Cannot resolve subscribed channels {[s for s, _ in subscription_slice]} at once, "
+            f"falling back to per-channel resolution",
+            exc_info=e,
+        )
+        chats_page = []
+        unavailable = []
+        for channel_id, _ in subscription_slice:
+            try:
+                chats_page.append(await user_client.get_entity(channel_id))
+            except (RPCError, ValueError):
+                unavailable.append(channel_id)
+        chats_page = [chat for chat in chats_page if chat]
 
     if not action_type:
         previous_offset = None
@@ -133,19 +156,26 @@ async def build_subscribed_channel_response(
         f"returning for subscribed channel request {action=}: {offset_stack=},{previous_offset=},{next_offset=}"
     )
 
-    return await format_channel_response(
-        "subs",
-        subscriptions_page.chats,
-        offset_stack,
-        previous_offset,
-        next_offset,
-        dict(subscriptions),
+    message_text, buttons, (pagination_data, attributes) = (
+        await format_channel_response(
+            "subs",
+            chats_page,
+            offset_stack,
+            previous_offset,
+            next_offset,
+            dict(subscriptions),
+        )
     )
+    if unavailable:
+        message_text += (
+            f"\nUnavailable: {", ".join(str(channel_id) for channel_id in unavailable)}"
+        )
+    return message_text, buttons, (pagination_data, attributes)
 
 
 async def format_channel_response(
     request_type: str,
-    items: list[Dialog] | list[object],
+    items: list[object],
     offset_stack: list[float | None] | list[int],
     previous_offset: Optional[float],
     next_offset: Optional[float],
@@ -163,8 +193,8 @@ async def format_channel_response(
     )
     channels_formatted = "\n".join(
         [
-            f"* {channel.title}: `{channel.id}`"
-            f"{f" - subscribed to {", ".join((f"{sink.name}(`{sink.id}`>{sink.filter})" for sink in subscriptions[utils.get_peer_id(utils.get_input_peer(channel))]))}" if utils.get_peer_id(utils.get_input_peer(channel)) in subscriptions else ""}"
+            f"* {entity_name(channel)}: `{utils.get_peer_id(channel)}`"
+            f"{f" - subscribed to {", ".join((f"{sink.name}(`{sink.id}`>{sink.filter})" for sink in subscriptions[utils.get_peer_id(channel)]))}" if utils.get_peer_id(channel) in subscriptions else ""}"
             for channel in items
         ]
     )

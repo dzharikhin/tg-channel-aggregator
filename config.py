@@ -1,9 +1,13 @@
 import json
+import logging
 import os
 import pathlib
 import re
+from datetime import datetime
 
 from subscription import Sink
+
+logger = logging.getLogger(__file__)
 
 api_id = os.getenv("API_ID")
 api_hash = os.getenv("API_HASH")
@@ -26,6 +30,21 @@ not_overridable_properties = {
 
 user_client_check_period_seconds = 10
 dialog_list_page_size = 10
+scheduler_tick_seconds = 30
+error_notify_throttle_seconds = 3600  # DM dedup window per key
+dedup_window_minutes = 60  # sink content dedup look-back
+send_min_interval_seconds = 1.0  # global bot API pacing
+queue_retry_backoff_seconds = 30  # /sync requeue backoff
+dm_queue_maxsize = 100
+dm_max_attempts = 5
+dm_backoff_start_seconds = 30
+dm_backoff_cap_seconds = 3600
+
+
+def _atomic_write(path: pathlib.Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 def override():
@@ -67,10 +86,14 @@ def get_channel_subscriptions(user_id: int, source_channel_id: int) -> list[Sink
     )
     if not subscription_path.exists():
         return []
-    sinks = [
-        Sink(sink_file.stem, sink_file.read_text())
-        for sink_file in subscription_path.iterdir()
-    ]
+    sinks = []
+    for sink_file in subscription_path.iterdir():
+        if sink_file.suffix != ".json" or not sink_file.is_file():
+            continue
+        try:
+            sinks.append(Sink(sink_file.stem, sink_file.read_text()))
+        except Exception as e:
+            logger.warning(f"skipping corrupt sink config {sink_file}: {e}")
     return sinks
 
 
@@ -87,6 +110,10 @@ def create_subscription(
     source_channel_id: int,
     sink: tuple[int, str],
     subscription_filter: tuple[str, str],
+    caption: str = "link",
+    schedule: str | None = None,
+    start_message_id: int | None = None,
+    batch: int = 1,
 ):
     user_path = data_path.joinpath(str(user_id))
     if not user_path.exists() or not user_path.is_dir():
@@ -97,16 +124,50 @@ def create_subscription(
     source_config_path = user_subscriptions_dir.joinpath(str(source_channel_id))
     source_config_path.mkdir(exist_ok=True)
     sink_config_path = source_config_path.joinpath(f"{sink[0]}.json")
-    sink_config = json.dumps(
-        {
-            "sink_name": sink[1],
-            "filter": {
-                "type": subscription_filter[0],
-                "params": json.loads(subscription_filter[1]),
-            },
-        }
+    existing_sink_config = {}
+    if sink_config_path.exists():
+        existing_sink_config = json.loads(sink_config_path.read_text())
+    sink_config = {
+        "sink_name": sink[1],
+        "caption": caption,
+        "filter": {
+            "type": subscription_filter[0],
+            "params": json.loads(subscription_filter[1]),
+        },
+    }
+    if schedule:
+        sink_config["schedule"] = schedule
+    if start_message_id is not None:
+        sink_config["start_message_id"] = start_message_id
+    if batch != 1:
+        sink_config["batch"] = batch
+    # runtime state survives re-subscription unless schedule-defining options
+    # changed: those start a fresh forwarding pointer
+    if existing_sink_config.get("state") and (
+        existing_sink_config.get("schedule") == sink_config.get("schedule")
+        and existing_sink_config.get("start_message_id")
+        == sink_config.get("start_message_id")
+    ):
+        sink_config["state"] = existing_sink_config["state"]
+    elif schedule:
+        # scheduler anchor: the next due time is the first cron occurrence
+        # after this moment
+        sink_config["state"] = {"last_run_at": datetime.now().isoformat()}
+    _atomic_write(sink_config_path, json.dumps(sink_config))
+
+
+def update_sink_state(
+    user_id: int, source_channel_id: int, sink_channel_id: int, state: dict
+):
+    sink_config_path = (
+        data_path.joinpath(str(user_id))
+        .joinpath("subscriptions")
+        .joinpath(str(source_channel_id))
+        .joinpath(f"{sink_channel_id}.json")
     )
-    sink_config_path.write_text(sink_config)
+    sink_config = json.loads(sink_config_path.read_text())
+    sink_config["state"] = state
+    _atomic_write(sink_config_path, json.dumps(sink_config))
 
 
 def remove_subscription(user_id: int, source_channel_id, sink_channel_id) -> bool:
