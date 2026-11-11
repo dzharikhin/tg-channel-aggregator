@@ -11,6 +11,16 @@ so the most reacted / most viewed posts of the year are at the top.
 Messages with zero reactions AND zero views are skipped
 (service messages, silent posts nobody saw, etc.).
 
+With --offset the yearly window is shifted back in time (e.g. months=1
+means 2025-12-01..2026-12-01 for year 2026): stats of a current year's
+fresh posts are relatively small, so we give them a better chance next
+year by comparing against a window ending before the year's last month.
+
+When at least --dense-min posts (default 10) are shown, the "dense leader"
+prefix is highlighted: consecutive leaders whose metric gaps are
+statistically small, while the gap after the last one is an outlier
+(z-score >= 2 vs the within-gaps).
+
 For audio posts (mp3 documents) the preview shows the audio attributes:
     [mp3] Title — Performer (3:10)
 falling back to the file name when the title attribute is missing.
@@ -31,6 +41,12 @@ Usage examples
     # only the top 25:
     python3 tg_top_posts.py @jrxpodcastdislike 2026 --limit 25
 
+    # shift the window 1 month back (2025-12-01 .. 2026-12-01):
+    python3 tg_top_posts.py @jrxpodcastdislike 2026 --offset months=1
+
+    # same, in days:
+    python3 tg_top_posts.py @jrxpodcastdislike 2026 --offset days=30
+
     # private channel by id:
     python3 tg_top_posts.py -1001111111111 2025
 
@@ -44,12 +60,14 @@ Dependencies:
 
 import argparse
 import asyncio
+import calendar
 import getpass
 import os
 import re
+import statistics
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 try:
@@ -154,6 +172,50 @@ def msg_link(entity, msg) -> Optional[str]:
 
 
 # ----------------------------------------------------------------------------
+# Time window / offset
+# ----------------------------------------------------------------------------
+
+
+def parse_offset(value: str) -> Tuple[str, int]:
+    """argparse type: 'months=N' or 'days=N' (case-insensitive)."""
+    m = re.fullmatch(r"\s*(days|months)\s*=\s*(\d+)\s*", value, re.IGNORECASE)
+    if not m or int(m.group(2)) < 1:
+        raise argparse.ArgumentTypeError(
+            "offset must be months=N or days=N with N >= 1 (got: %r)" % value
+        )
+    return m.group(1).lower(), int(m.group(2))
+
+
+def fmt_offset(offset: Tuple[str, int]) -> str:
+    unit, n = offset
+    name = unit[:-1]  # days -> day, months -> month
+    return "%d %s" % (n, name if n == 1 else name + "s")
+
+
+def shift_months(dt: datetime, months: int) -> datetime:
+    """Shift dt back by whole months, clamping the day to the month length."""
+    total = dt.year * 12 + (dt.month - 1) - months
+    year, month0 = divmod(total, 12)
+    month = month0 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def offset_window(
+    year: int, offset: Optional[Tuple[str, int]]
+) -> Tuple[datetime, datetime]:
+    """[start, end) window of the year, optionally shifted back by offset."""
+    start = datetime(year, 1, 1, tzinfo=timezone.utc)
+    end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    if offset is None:
+        return start, end
+    unit, n = offset
+    if unit == "months":
+        return shift_months(start, n), shift_months(end, n)
+    return start - timedelta(days=n), end - timedelta(days=n)
+
+
+# ----------------------------------------------------------------------------
 # Telegram I/O
 # ----------------------------------------------------------------------------
 
@@ -192,15 +254,15 @@ def display(e) -> str:
     return "%s (id %s)" % (name or getattr(e, "username", None) or "?", e.id)
 
 
-async def fetch_year(client, channel, year: int) -> Tuple[list, int]:
-    """Collect (msg, reactions, views) tuples for the calendar year.
+async def fetch_window(
+    client, channel, start: datetime, end: datetime
+) -> Tuple[list, int]:
+    """Collect (msg, reactions, views) tuples for the [start, end) window.
 
-    Iterates newest-first starting from Jan 1 of year+1 (offset_date is
-    documented as 'only messages with a lower date are retrieved') and stops
-    once messages older than Jan 1 of the year appear.
+    Iterates newest-first starting from `end` (offset_date is documented as
+    'only messages with a lower date are retrieved') and stops once messages
+    older than `start` appear.
     """
-    start = datetime(year, 1, 1, tzinfo=timezone.utc)
-    end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
     collected: List[tuple] = []
     seen = set()
     fetched = 0
@@ -333,6 +395,44 @@ async def qr_login_flow(client, overall_timeout: float = 300.0):
 
 
 # ----------------------------------------------------------------------------
+# Dense leader group
+# ----------------------------------------------------------------------------
+
+DENSE_MIN_ITEMS = 10  # below this the whole table is the leaderboard
+DENSE_MIN_GROUP = 3  # >= 2 within-gaps are needed for mean/σ
+DENSE_Z_THRESHOLD = 2.0  # boundary gap must be an outlier vs within-gaps
+
+
+def dense_leader_boundary(
+    scores: List[int], min_items: int = DENSE_MIN_ITEMS
+) -> Optional[tuple]:
+    """Last index of the dense leader prefix of descending scores, else None.
+
+    The leaders are items 0..b: their consecutive gaps are statistically
+    small, while the gap right after b is an outlier — its z-score against
+    the within-gaps (population mean/σ, σ=0 guarded by eps) is the maximum
+    among candidates and >= DENSE_Z_THRESHOLD.
+
+    Returns (b, gap, mean, sigma, z) or None.
+    """
+    n = len(scores)
+    if n < min_items:
+        return None
+    gaps = [scores[i] - scores[i + 1] for i in range(n - 1)]
+    best = None
+    best_z = DENSE_Z_THRESHOLD
+    for b in range(DENSE_MIN_GROUP - 1, n - 1):
+        within = gaps[:b]
+        mu = statistics.fmean(within)
+        sigma = statistics.pstdev(within)
+        z = (gaps[b] - mu) / (sigma + 1e-9)
+        if z > best_z:
+            best = (b, gaps[b], mu, sigma, z)
+            best_z = z
+    return best
+
+
+# ----------------------------------------------------------------------------
 # CLI / main
 # ----------------------------------------------------------------------------
 
@@ -357,6 +457,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="show only the top N posts (default: all)",
+    )
+    p.add_argument(
+        "--offset",
+        type=parse_offset,
+        default=None,
+        metavar="months=N|days=N",
+        help="shift the yearly window back by a duration, e.g. months=1 or "
+        "days=30: for year=2026 and months=1 the window becomes "
+        "2025-12-01..2026-12-01, giving fresh posts a fairer comparison "
+        "(default: plain calendar year)",
+    )
+    p.add_argument(
+        "--dense-min",
+        type=int,
+        default=DENSE_MIN_ITEMS,
+        metavar="N",
+        help="minimum number of shown posts for the dense leader highlight "
+        "to apply; below it the whole table is the leaderboard "
+        "(default: %d)" % DENSE_MIN_ITEMS,
     )
     p.add_argument(
         "--api-id", help="telegram api_id (else TELEGRAM_API_ID env or prompt)"
@@ -421,35 +540,65 @@ async def main() -> None:
     except errors.ChannelPrivateError:
         die("channel is private / not accessible for this account")
     print("Channel: %s" % display(channel))
-    print("Year:    %d" % year)
+    start, end = offset_window(year, args.offset)
+    if args.offset:
+        print("Year:    %d (offset: %s back)" % (year, fmt_offset(args.offset)))
+    else:
+        print("Year:    %d" % year)
+    print("Window:  %s .. %s (end exclusive)" % (start.date(), end.date()))
     print("-" * 72)
 
-    collected, fetched = await fetch_year(client, channel, year)
+    collected, fetched = await fetch_window(client, channel, start, end)
     collected.sort(key=lambda t: (-t[1], -t[2]))  # reactions desc, views desc
     shown = collected if args.limit is None else collected[: max(args.limit, 0)]
 
     if not shown:
         print(
-            "No posts with reactions/views found for %d (fetched %d messages)."
-            % (year, fetched)
+            "No posts with reactions/views found in %s..%s (fetched %d messages)."
+            % (start.date(), end.date(), fetched)
         )
         await client.disconnect()
         return
 
+    # dense leader detection: reactions, falling back to views when the
+    # whole table has no reactions at all
+    if any(t[1] > 0 for t in shown):
+        metric, scores = "react", [t[1] for t in shown]
+    else:
+        metric, scores = "views", [t[2] for t in shown]
+    dense = dense_leader_boundary(scores, args.dense_min)
+
+    tty = sys.stdout.isatty()
     print("%4s  %-10s  %8s  %8s  %s" % ("#", "date", "react", "views", "preview"))
     print("-" * 72)
     for i, (msg, reactions, views) in enumerate(shown, 1):
         when = msg.date.astimezone(tz=None).strftime("%Y-%m-%d")
-        print(
-            "%4d  %-10s  %8d  %8d  %s" % (i, when, reactions, views, msg_preview(msg))
+        highlight = dense is not None and i <= dense[0] + 1
+        row = "%4d%s %-10s  %8d  %8d  %s" % (
+            i,
+            "▸" if highlight and not tty else " ",
+            when,
+            reactions,
+            views,
+            msg_preview(msg),
         )
+        if highlight and tty:
+            row = "\033[1m" + row + "\033[0m"
+        print(row)
         link = msg_link(channel, msg)
         if link:
             print("      %s" % link)
+        if dense is not None and i == dense[0] + 1:
+            _, gap, mu, sigma, z = dense
+            print("-" * 72)
+            print(
+                "▲ dense leaders: #1–#%d by %s; gap to #%d: %d vs within gaps "
+                "μ=%.1f σ=%.1f (z=%.1f)" % (i, metric, i + 1, gap, mu, sigma, z)
+            )
     print("-" * 72)
     print(
-        "Shown: %d / kept: %d / fetched: %d message(s) for %d."
-        % (len(shown), len(collected), fetched, year)
+        "Shown: %d / kept: %d / fetched: %d message(s) in %s..%s."
+        % (len(shown), len(collected), fetched, start.date(), end.date())
     )
 
     await client.disconnect()
